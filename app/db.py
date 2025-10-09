@@ -1,24 +1,18 @@
-# app/db.py  — version locale (sans SSL)
+# app/db.py
 import os
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.orm import DeclarativeBase
-from dotenv import load_dotenv
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
-load_dotenv(override=True)
+DATABASE_URL = os.getenv("DATABASE_URL", "").split("?")[0]  # ⬅️ on enlève toute query (?sslmode=...)
+# IMPORTANT: forcer SSL côté asyncpg proprement
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    connect_args={"ssl": True},   # ⬅️ c'est ce que asyncpg attend
+)
 
-DB_URL = os.getenv("DATABASE_URL", "")
-if not DB_URL:
-    raise RuntimeError("DATABASE_URL manquant dans .env")
+SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)
 
-# passe en asyncpg pour SQLAlchemy async
-DB_URL_ASYNC = DB_URL.replace("postgresql+psycopg", "postgresql+asyncpg").replace("postgresql://", "postgresql+asyncpg://")
-
-engine = create_async_engine(DB_URL_ASYNC, echo=False, pool_pre_ping=True)
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
-
-class Base(DeclarativeBase):
-    pass
-
-async def get_db() -> AsyncSession:
+async def get_db():
     async with SessionLocal() as session:
         yield session
+
