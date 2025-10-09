@@ -1,13 +1,13 @@
 # app/db.py
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.pool import NullPool
 
-# strip() pour enlever un éventuel \n collé en fin de valeur
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip().split("?")[0]
 
-# ⬇️ Pas de connect_args: on laisse asyncpg négocier le TLS comme dans ping-db-deep
 engine = create_async_engine(
-    DATABASE_URL,                 # postgresql+asyncpg://USER:PASS@HOST:5432/postgres
+    DATABASE_URL,
+    poolclass=NullPool,     # ← évite de monopoliser le pooler Supabase
     pool_pre_ping=True,
 )
 

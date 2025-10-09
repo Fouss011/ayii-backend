@@ -11,9 +11,12 @@ from apscheduler.triggers.interval import IntervalTrigger
 from app.db import get_db
 from app.services.aggregation import run_aggregation
 
-load_dotenv()  # charge .env en local (DATABASE_URL, etc.)
+if os.getenv("RENDER") is None and os.getenv("ENV", "dev") == "dev":
+    load_dotenv()
 
 scheduler = AsyncIOScheduler()
+
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
