@@ -7,6 +7,11 @@ from app.services.aggregation import run_aggregation
 
 router = APIRouter(prefix="/dev", tags=["dev"])
 
+@router.get("/ping-db")
+async def ping_db(db: AsyncSession = Depends(get_db)):
+    r = await db.execute(text("SELECT 1"))
+    return {"db_ok": bool(r.scalar_one() == 1)}
+
 @router.post("/aggregate")
 async def dev_aggregate(db: AsyncSession = Depends(get_db)):
     try:
