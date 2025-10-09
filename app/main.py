@@ -1,25 +1,31 @@
 # app/main.py
 import os
 from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+from app.db import get_db
 from app.services.aggregation import run_aggregation
-from app.db import get_db  # async dependency
+
+load_dotenv()  # charge .env en local (DATABASE_URL, etc.)
 
 scheduler = AsyncIOScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ---- Startup ----
     enable = os.getenv("SCHEDULER_ENABLED", "1") != "0"
     if enable:
         interval = int(os.getenv("AGG_INTERVAL_MIN", "2"))
 
         async def job():
-            agen = get_db()
-            db = await agen.__anext__()
+            # ouvre proprement une session via get_db()
+            agen = get_db()                 # get_db est un async generator
+            db = await agen.__anext__()     # récupère une AsyncSession
             try:
                 await run_aggregation(db)
             except Exception as e:
@@ -30,38 +36,51 @@ async def lifespan(app: FastAPI):
                 except Exception:
                     pass
 
-        scheduler.add_job(job, trigger=IntervalTrigger(minutes=interval))
+        scheduler.add_job(job, trigger=IntervalTrigger(minutes=interval), id="ayii_agg", replace_existing=True)
         scheduler.start()
         print(f"[scheduler] started (every {interval} min)")
     else:
         print("[scheduler] disabled via SCHEDULER_ENABLED=0")
+
     yield
+
+    # ---- Shutdown ----
     if scheduler.running:
         scheduler.shutdown(wait=False)
         print("[scheduler] stopped")
 
-# ✅ debug=True pour voir la stacktrace dans le navigateur
-app = FastAPI(title="Awo API", debug=True, lifespan=lifespan)
 
-# ✅ CORS DEV large
+# Tu peux changer le titre si tu veux
+app = FastAPI(title="Ayii API", lifespan=lifespan)
+
+# ---------- CORS ----------
+# Origin Netlify en prod + localhost pour le dev
+FRONT_ORIGIN = os.getenv("FRONT_ORIGIN", "https://ayii.netlify.app")
+origins = [
+    FRONT_ORIGIN,                # prod (Netlify)
+    "http://localhost:3000",     # dev local
+    "http://127.0.0.1:3000",     # dev local
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=origins,       # mets ["*"] temporairement si besoin de tester
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Health
+# ---------- Health ----------
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-# Routes
+# ---------- Routes ----------
 from app.routes.report import router as report_router
 from app.routes.map import router as map_router
 from app.routes.dev import router as dev_router
 
+# optionnels si présents
 try:
     from app.routes.reverse import router as reverse_router
     app.include_router(reverse_router)
