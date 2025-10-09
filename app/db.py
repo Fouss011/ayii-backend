@@ -1,23 +1,23 @@
 # app/db.py
-import os
-from fastapi import HTTPException  # <-- ajoute ça
+import os, ssl, certifi
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").split("?")[0]
 
+# ✅ Construit un contexte TLS qui connaît les autorités racines (certifi)
+ssl_ctx = ssl.create_default_context()
+ssl_ctx.load_verify_locations(certifi.where())
+ssl_ctx.check_hostname = True
+ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+
 engine = create_async_engine(
-    DATABASE_URL,
+    DATABASE_URL,                 # postgresql+asyncpg://...
     pool_pre_ping=True,
-    connect_args={"ssl": True},
+    connect_args={"ssl": ssl_ctx} # ✅ au lieu de {"ssl": True}
 )
 
 SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)
 
 async def get_db():
-    try:
-        async with SessionLocal() as session:
-            yield session
-    except Exception as e:
-        # log console + message HTTP clair
-        print("[DB] connect error:", repr(e))
-        raise HTTPException(status_code=500, detail=f"DB connect error: {e.__class__.__name__}: {e}")
+    async with SessionLocal() as session:
+        yield session
