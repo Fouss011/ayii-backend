@@ -1,19 +1,16 @@
 # app/db.py
-import os, ssl, certifi
+import os, ssl
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").split("?")[0]
 
-# ✅ Construit un contexte TLS qui connaît les autorités racines (certifi)
-ssl_ctx = ssl.create_default_context()
-ssl_ctx.load_verify_locations(certifi.where())
-ssl_ctx.check_hostname = True
-ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+# ✅ Contexte TLS par défaut (mêmes CA que le système, comme ton test asyncpg OK)
+ssl_ctx = ssl.create_default_context()   # NE PAS charger certifi ici
 
 engine = create_async_engine(
-    DATABASE_URL,                 # postgresql+asyncpg://...
+    DATABASE_URL,                       # postgresql+asyncpg://...
     pool_pre_ping=True,
-    connect_args={"ssl": ssl_ctx} # ✅ au lieu de {"ssl": True}
+    connect_args={"ssl": ssl_ctx},      # <- passer le SSLContext (pas True/False)
 )
 
 SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)
