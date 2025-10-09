@@ -1,16 +1,14 @@
 # app/db.py
-import os, ssl
+import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").split("?")[0]
+# strip() pour enlever un éventuel \n collé en fin de valeur
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip().split("?")[0]
 
-# ✅ Contexte TLS par défaut (mêmes CA que le système, comme ton test asyncpg OK)
-ssl_ctx = ssl.create_default_context()   # NE PAS charger certifi ici
-
+# ⬇️ Pas de connect_args: on laisse asyncpg négocier le TLS comme dans ping-db-deep
 engine = create_async_engine(
-    DATABASE_URL,                       # postgresql+asyncpg://...
+    DATABASE_URL,                 # postgresql+asyncpg://USER:PASS@HOST:5432/postgres
     pool_pre_ping=True,
-    connect_args={"ssl": ssl_ctx},      # <- passer le SSLContext (pas True/False)
 )
 
 SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)
