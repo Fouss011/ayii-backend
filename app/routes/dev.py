@@ -95,12 +95,16 @@ async def ping_db_deep():
     apg_ok, apg_err = False, None
     try:
         apg_dsn = dsn.replace("postgresql+asyncpg://","postgresql://").replace("postgresql+psycopg://","postgresql://")
-        conn = await asyncpg.connect(dsn=apg_dsn, timeout=5.0)  # sslmode=require doit déjà être dans le DSN
+        conn = await asyncpg.connect(
+            dsn=apg_dsn,
+            timeout=5.0,
+            statement_cache_size=0,   # 🔑 idem ici
+        )
         val = await conn.fetchval("SELECT 1")
         apg_ok = (val == 1)
         await conn.close()
     except Exception as e:
-        apg_err = f"asyncpg: {e.__class__.__name__}: {e}"
+        apg_err = f"asyncpg: {e.__class__.__name__}: {e}""
 
     return {
         "dsn": safe_dsn,
