@@ -67,3 +67,38 @@ async def ping_db_deep():
         "asyncpg_ok": apg_ok,
         "asyncpg_error": apg_err,
     }
+
+# --- /dev/env-db : affiche la valeur (sécurisée) de DATABASE_URL ---
+from fastapi.responses import JSONResponse
+from app.db import engine
+from sqlalchemy import text
+import os
+
+@router.get("/env-db")
+async def env_db():
+    dsn = os.getenv("DATABASE_URL", "")
+    safe = dsn
+    try:
+        if "://" in dsn and "@" in dsn:
+            proto, rest = dsn.split("://", 1)
+            safe = proto + "://" + rest.split("@")[-1]
+    except Exception:
+        pass
+    return {
+        "DATABASE_URL_safe": safe,
+        "has_ssl_query": ("?sslmode=" in dsn.lower()),
+        "driver_hint": ("+asyncpg" in dsn),
+    }
+
+# --- /dev/ping-db-safe : test via SQLAlchemy/engine, message JSON clair ---
+@router.get("/ping-db-safe")
+async def ping_db_safe():
+    try:
+        async with engine.begin() as conn:
+            val = await conn.scalar(text("SELECT 1"))
+        return {"ok": True, "db_ok": bool(val == 1)}
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "where": "sqlalchemy/engine.begin", "error": f"{e.__class__.__name__}: {e}"}
+        )

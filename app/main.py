@@ -99,3 +99,8 @@ except Exception:
 app.include_router(report_router)
 app.include_router(map_router)
 app.include_router(dev_router)
+
+
+@app.get("/__routes")
+async def list_routes():
+    return sorted([r.path for r in app.routes])
