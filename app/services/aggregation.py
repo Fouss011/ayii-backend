@@ -81,11 +81,12 @@ async def run_aggregation(db: AsyncSession):
             HAVING COUNT(*) >= {MIN_REPORTS}
         )
         INSERT INTO outages (kind, status, center, radius_m, started_at)
-        SELECT c.kind,
-               'ongoing',
-               ST_SetSRID(c.center_geom, 4326)::geography,
-               {DEFAULT_RADIUS_M},
-               now()
+        SELECT
+            CAST(c.kind::text AS outage_kind)               -- ✅ conversion report_kind -> outage_kind
+          , 'ongoing'
+          , ST_SetSRID(c.center_geom, 4326)::geography
+          , {DEFAULT_RADIUS_M}
+          , now()
           FROM clusters c
          WHERE NOT EXISTS (
                 SELECT 1
