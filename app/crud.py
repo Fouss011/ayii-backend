@@ -67,8 +67,21 @@ async def insert_report(
       - cut sur incident_kinds   => upsert/refresh d’un incident proche
       - restored sur incident_kinds => clear du plus proche
     """
+
+    # --- si un user_id est fourni, on s'assure qu'il existe dans app_users (sinon FK casse)
+    if user_id:
+        try:
+            await db.execute(
+                text("INSERT INTO app_users (id) VALUES (CAST(:uid AS uuid)) ON CONFLICT (id) DO NOTHING"),
+                {"uid": user_id},
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            # on ne bloque pas le report pour un souci d'upsert user; on réessaiera l'insert plus bas avec NULL si besoin
+
     # Détecte le vrai type des colonnes (enum/text/etc.)
-    kind_typ = await get_column_typename(db, "reports", "kind")      # ex: report_kind ou text
+    kind_typ = await get_column_typename(db, "reports", "kind")      # ex: outage_kind ou text
     sig_typ  = await get_column_typename(db, "reports", "signal")    # ex: report_signal ou text
     kind_is_enum = await is_enum_typename(db, kind_typ)
     sig_is_enum  = await is_enum_typename(db, sig_typ)
@@ -83,7 +96,11 @@ async def insert_report(
             CAST(:kind AS {kind_cast}),
             CAST(:signal AS {sig_cast}),
             ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
-            :accuracy_m, :note, :photo_url, :user_id
+            :accuracy_m, :note, :photo_url,
+            CASE
+              WHEN :user_id IS NULL THEN NULL
+              ELSE CAST(:user_id AS uuid)
+            END
         )
         RETURNING id
     """)
@@ -91,7 +108,8 @@ async def insert_report(
     try:
         res = await db.execute(insert_sql, {
             "kind": kind, "signal": signal, "lat": lat, "lng": lng,
-            "accuracy_m": accuracy_m, "note": note, "photo_url": photo_url, "user_id": user_id
+            "accuracy_m": accuracy_m, "note": note, "photo_url": photo_url,
+            "user_id": user_id  # peut être None; si string -> CAST uuid
         })
         report_id = res.scalar_one()
         await db.commit()
@@ -101,24 +119,22 @@ async def insert_report(
 
     # Actions auto (tolérance “rétabli à proximité” + incidents)
     try:
-        # power/water: restored => tentative de fermeture de zone la plus proche
         if signal == "restored" and kind in KINDS_OUTAGE:
             await close_nearest_outage_on_restored(db, kind, lat, lng)
 
-        # incidents: cut => upsert/refresh d'un incident proche
         if signal == "cut" and kind in INCIDENT_KINDS:
             await upsert_incident_from_report(db, kind, lat, lng)
 
-        # incidents: restored => clear du plus proche
         if signal == "restored" and kind in INCIDENT_KINDS:
             await clear_nearest_incident(db, kind, lat, lng)
 
         await db.commit()
     except Exception:
         await db.rollback()
-        # On n'annule pas le report si l'action auto échoue
+        # on n'annule pas le report si l'action auto échoue
 
     return report_id
+
 
 
 # --- Map / lecture ---------------------------------------------------------
