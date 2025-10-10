@@ -97,11 +97,11 @@ async def ping_db_safe():
     from app.db import engine
     try:
         async with engine.connect() as conn:
-            conn = conn.execution_options(preparer=None)  # évite toute préparation côté SQLA
+            conn = conn.execution_options(preparer=None)
             val = (await conn.exec_driver_sql("SELECT 1")).scalar()
         return {"ok": True, "db_ok": bool(val == 1)}
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "where": "sqlalchemy/connect", "error": f"{e.__class__.__name__}: {e}"}
-        )
+        return JSONResponse(status_code=500, content={
+            "ok": False, "where": "sqlalchemy/connect", "error": f"{e.__class__.__name__}: {e}"
+        })
+
