@@ -1,28 +1,23 @@
 # app/db.py
 import os
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.pool import NullPool
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
-# Récup DSN tel quel (sans \n ni quotes)
-raw = os.getenv("DATABASE_URL", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL")  # ex: postgresql+psycopg://...:6543/postgres
 
-# ⚠️ Force psycopg (pas asyncpg), sinon on retombe sur l'erreur pgbouncer
-# Si jamais quelqu’un met 'postgresql+asyncpg', on remplace par psycopg.
-DATABASE_URL = raw.replace("postgresql+asyncpg://", "postgresql+psycopg://")
-
-# Avec PgBouncer (pool_mode=transaction), on évite le pool côté app
-# + on désactive les prepared statements côté psycopg (prepare_threshold=None)
+# 👉 paramètres anti-stale + petit pool (pgBouncer)
 engine = create_async_engine(
     DATABASE_URL,
-    poolclass=NullPool,        # pas de pool SQLAlchemy (laisse PgBouncer gérer)
-    pool_pre_ping=True,
+    pool_size=5,              # petit, stable
+    max_overflow=2,           # limiter les pics
+    pool_recycle=300,         # recycle connexions >5 min
+    pool_pre_ping=True,       # teste la connexion avant usage
     connect_args={
-        "sslmode": "require",       # Supabase pooler requiert SSL
-        "prepare_threshold": None,  # désactive les prepared statements (psycopg v3)
+        # côté psycopg3, rien d’exotique nécessaire avec pgBouncer
+        # on garde vide; si tu as un CA, tu peux ajouter: "sslmode":"require"
     },
 )
 
-SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 async def get_db():
     async with SessionLocal() as session:
