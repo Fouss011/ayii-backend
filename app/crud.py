@@ -143,15 +143,16 @@ async def get_outages_in_radius(
           id, kind, status,
           ST_Y(center::geometry) AS lat,
           ST_X(center::geometry) AS lng,
-          radius_m, started_at, restored_at, label_override
+          radius_m, started_at, restored_at
         FROM outages
         WHERE ST_DWithin(
-            center,
-            (SELECT g FROM me),
-            CAST(:meters AS double precision) + radius_m
-        )
+          center,
+          (SELECT g FROM me),
+          CAST(:meters AS double precision) + radius_m
+        ) 
         ORDER BY started_at DESC
     """).bindparams(bindparam("meters", type_=Float))
+
 
     out_res = await db.execute(q_outages, {"lat": lat, "lng": lng, "meters": meters})
     outages = [
