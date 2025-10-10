@@ -58,17 +58,18 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Ayii API", lifespan=lifespan)
 
 # ---------- CORS ----------
-# Origin Netlify en prod + localhost pour le dev
+from fastapi.middleware.cors import CORSMiddleware
+
 FRONT_ORIGIN = os.getenv("FRONT_ORIGIN", "https://ayii.netlify.app").strip()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONT_ORIGIN, "http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_origin_regex=r"^https://[a-z0-9-]+\.netlify\.app$",   # autorise toutes les previews Netlify
+    allow_origins=[FRONT_ORIGIN, "https://ayii.netlify.app", "http://localhost:3000", "http://127.0.0.1:3000"],
+    # ⚠️ retire le allow_origin_regex pour éviter toute ambiguïté
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    
+    allow_methods=["GET", "POST", "OPTIONS"],   # ou ["*"] si tu préfères
+    allow_headers=["*"],                        # Content-Type, etc.
+    expose_headers=["*"],
 )
 
 # ---------- Health ----------
