@@ -136,22 +136,23 @@ async def get_outages_in_radius(
 
     # Outages (ongoing/restored)
     q_outages = text("""
-        WITH me AS (
-          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-        )
-        SELECT
-          id, kind, status,
-          ST_Y(center::geometry) AS lat,
-          ST_X(center::geometry) AS lng,
-          radius_m, started_at, restored_at
-        FROM outages
-        WHERE ST_DWithin(
-          center,
-          (SELECT g FROM me),
-          CAST(:meters AS double precision) + radius_m
-        ) 
-        ORDER BY started_at DESC
-    """).bindparams(bindparam("meters", type_=Float))
+    WITH me AS (
+      SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+    )
+    SELECT
+      id, kind, status,
+      ST_Y(center::geometry) AS lat,
+      ST_X(center::geometry) AS lng,
+      radius_m, started_at, restored_at
+    FROM outages
+    WHERE ST_DWithin(
+        center,
+        (SELECT g FROM me),
+        CAST(:meters AS double precision) + radius_m
+    )
+    ORDER BY started_at DESC
+""").bindparams(bindparam("meters", type_=Float))
+
 
 
     out_res = await db.execute(q_outages, {"lat": lat, "lng": lng, "meters": meters})
@@ -164,7 +165,7 @@ async def get_outages_in_radius(
             "radius_m": int(r.radius_m),
             "started_at": r.started_at,
             "restored_at": r.restored_at,
-            "label_override": r.label_override,
+            
         }
         for r in out_res.fetchall()
     ]
