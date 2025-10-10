@@ -94,14 +94,16 @@ async def env_db():
 @router.get("/ping-db-safe")
 async def ping_db_safe():
     from fastapi.responses import JSONResponse
+    from sqlalchemy import text
     from app.db import engine
     try:
-        async with engine.connect() as conn:
-            conn = conn.execution_options(preparer=None)
-            val = (await conn.exec_driver_sql("SELECT 1")).scalar()
+        async with engine.begin() as conn:
+            val = await conn.scalar(text("SELECT 1"))
         return {"ok": True, "db_ok": bool(val == 1)}
     except Exception as e:
-        return JSONResponse(status_code=500, content={
-            "ok": False, "where": "sqlalchemy/connect", "error": f"{e.__class__.__name__}: {e}"
-        })
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "where": "sqlalchemy/connect", "error": f"{type(e).__name__}: {e}"}
+        )
+
 
