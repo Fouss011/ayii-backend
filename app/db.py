@@ -1,26 +1,22 @@
-# app/db.py  — Pooler Supabase (port 6543), compatible PgBouncer
-import os, asyncpg
+# app/db.py — Psycopg async + PgBouncer (6543) + petit nettoyage
+import os
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.pool import NullPool
 
-RAW_URL = os.getenv("DATABASE_URL", "").strip()           # retire espaces / retours
-DATABASE_URL = RAW_URL.split("?")[0]                      # supprime toute query
-ASYNC_PG_DSN = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+def _clean(url: str) -> str:
+    url = (url or "").strip()
+    if (url.startswith('"') and url.endswith('"')) or (url.startswith("'") and url.endswith("'")):
+        url = url[1:-1]
+    url = url.replace("\\n", "").replace("\n", "").replace("\r", "").strip()
+    return url.split("?")[0]
 
-async def _asyncpg_connect():
-    # 🔑 Désactive complètement les prepared statements (exigé par PgBouncer en mode "transaction")
-    return await asyncpg.connect(
-        dsn=ASYNC_PG_DSN,
-        statement_cache_size=0,
-        prepared_statement_cache_size=0,
-        timeout=10.0,
-    )
+DATABASE_URL = _clean(os.getenv("DATABASE_URL", ""))
 
 engine = create_async_engine(
-    DATABASE_URL,                 # postgresql+asyncpg://…:6543/postgres
-    poolclass=NullPool,           # n’accapare pas le pooler
+    DATABASE_URL,           # postgresql+psycopg://...:6543/postgres
+    poolclass=NullPool,
     pool_pre_ping=True,
-    async_creator=_asyncpg_connect,  # utilise notre connecteur asyncpg custom
+    connect_args={"prepare_threshold": 0},  # clé pour PgBouncer (transaction)
 )
 
 SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)
