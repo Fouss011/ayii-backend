@@ -96,12 +96,13 @@ except Exception:
 
 app.include_router(report_router)
 app.include_router(map_router)
-app.include_router(dev_router)
 
-
-@app.get("/__routes")
-async def list_routes():
-    return sorted([r.path for r in app.routes])
-
+# 👉 n’activer /dev/* qu’en dev
 if os.getenv("ENV", "dev") == "dev":
     app.include_router(dev_router)
+
+# (facultatif) exposer la liste des routes seulement en dev
+if os.getenv("ENV", "dev") == "dev":
+    @app.get("/__routes")
+    async def list_routes():
+        return sorted([r.path for r in app.routes])
