@@ -1,36 +1,29 @@
-# app/db.py — AsyncPG + PgBouncer (6543), no prepared statements, NullPool
-import os, asyncpg
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+# app/db.py
+import os
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.pool import NullPool
 
-def _clean(url: str) -> str:
-    url = (url or "").strip()
-    if (url.startswith('"') and url.endswith('"')) or (url.startswith("'") and url.endswith("'")):
-        url = url[1:-1]
-    return url.replace("\\n","").replace("\n","").replace("\r","").strip()
+# Récup DSN tel quel (sans \n ni quotes)
+raw = os.getenv("DATABASE_URL", "").strip()
 
-RAW = _clean(os.getenv("DATABASE_URL", ""))
-# 👉 on convertit l'URL en asyncpg, même si Render stocke +psycopg
-SQLA_URL = RAW.replace("postgresql+psycopg://", "postgresql+asyncpg://")
-ASYNC_PG_DSN = SQLA_URL.replace("postgresql+asyncpg://", "postgresql://")
+# ⚠️ Force psycopg (pas asyncpg), sinon on retombe sur l'erreur pgbouncer
+# Si jamais quelqu’un met 'postgresql+asyncpg', on remplace par psycopg.
+DATABASE_URL = raw.replace("postgresql+asyncpg://", "postgresql+psycopg://")
 
-async def _asyncpg_connect():
-    # 🔑 désactive totalement les prepared statements (clé avec PgBouncer transaction)
-    return await asyncpg.connect(
-        dsn=ASYNC_PG_DSN,
-        statement_cache_size=0,
-        timeout=10.0,
-    )
-
+# Avec PgBouncer (pool_mode=transaction), on évite le pool côté app
+# + on désactive les prepared statements côté psycopg (prepare_threshold=None)
 engine = create_async_engine(
-    SQLA_URL,              # postgresql+asyncpg://...:6543/postgres
-    poolclass=NullPool,    # ne monopolise pas PgBouncer
+    DATABASE_URL,
+    poolclass=NullPool,        # pas de pool SQLAlchemy (laisse PgBouncer gérer)
     pool_pre_ping=True,
-    async_creator=_asyncpg_connect,  # impose notre connecteur
+    connect_args={
+        "sslmode": "require",       # Supabase pooler requiert SSL
+        "prepare_threshold": None,  # désactive les prepared statements (psycopg v3)
+    },
 )
 
-SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)
+SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)
 
-async def get_db() -> AsyncSession:
+async def get_db():
     async with SessionLocal() as session:
         yield session
