@@ -61,7 +61,6 @@ app = FastAPI(title="Ayii API", lifespan=lifespan)
 # ---------- CORS ----------
 from fastapi.middleware.cors import CORSMiddleware
 
-FRONT_ORIGIN = (os.getenv("FRONT_ORIGIN", "https://ayii.netlify.app") or "").strip()
 
 # ⚠️ MODE DIAG: ouverture totale pour vérifier le CORS (TEMPORAIRE)
 # Quand c'est bon, repasse au bloc "STRICT" en-dessous.
