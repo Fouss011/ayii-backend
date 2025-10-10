@@ -48,6 +48,8 @@ CLOSE_HARDCAP = 1500.0 # ou si dist <= 1500 m
 
 # --- Inserts / Reports -----------------------------------------------------
 
+from sqlalchemy.dialects.postgresql import UUID
+
 async def insert_report(
     db: AsyncSession,
     *,
@@ -61,14 +63,11 @@ async def insert_report(
     user_id: Optional[str] = None,
 ) -> str:
     """
-    Insère un report dans 'reports' en castant dynamiquement les types (enum/text).
-    Déclenche ensuite les actions auto :
-      - restored sur power/water => tentative de fermeture d’une zone proche
-      - cut sur incident_kinds   => upsert/refresh d’un incident proche
-      - restored sur incident_kinds => clear du plus proche
+    Insert dans reports (en tenant compte des enums dynamiques) + actions auto.
+    Garantit que user_id respecte la FK vers app_users (upsert si besoin).
     """
 
-    # --- si un user_id est fourni, on s'assure qu'il existe dans app_users (sinon FK casse)
+    # 0) si user_id fourni -> s'assurer que app_users contient la clé
     if user_id:
         try:
             await db.execute(
@@ -78,18 +77,18 @@ async def insert_report(
             await db.commit()
         except Exception:
             await db.rollback()
-            # on ne bloque pas le report pour un souci d'upsert user; on réessaiera l'insert plus bas avec NULL si besoin
+            # on continue; l'insert échouera si la FK n'est pas satisfaite
 
-    # Détecte le vrai type des colonnes (enum/text/etc.)
-    kind_typ = await get_column_typename(db, "reports", "kind")      # ex: outage_kind ou text
-    sig_typ  = await get_column_typename(db, "reports", "signal")    # ex: report_signal ou text
+    # 1) introspection des types (enum/text) pour kind/signal
+    kind_typ = await get_column_typename(db, "reports", "kind")
+    sig_typ  = await get_column_typename(db, "reports", "signal")
     kind_is_enum = await is_enum_typename(db, kind_typ)
     sig_is_enum  = await is_enum_typename(db, sig_typ)
 
-    # Construit dynamiquement le CAST correct pour chaque colonne
     kind_cast = kind_typ if kind_is_enum else "text"
     sig_cast  = sig_typ  if sig_is_enum  else "text"
 
+    # 2) insert (⚠️ on typpe user_id et on le CAST directement)
     insert_sql = text(f"""
         INSERT INTO reports (kind, signal, geom, accuracy_m, note, photo_url, user_id)
         VALUES (
@@ -97,19 +96,18 @@ async def insert_report(
             CAST(:signal AS {sig_cast}),
             ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
             :accuracy_m, :note, :photo_url,
-            CASE
-              WHEN :user_id IS NULL THEN NULL
-              ELSE CAST(:user_id AS uuid)
-            END
+            CAST(:user_id AS uuid)
         )
         RETURNING id
-    """)
+    """).bindparams(
+        bindparam("user_id", type_=UUID(as_uuid=False))
+    )
 
     try:
         res = await db.execute(insert_sql, {
             "kind": kind, "signal": signal, "lat": lat, "lng": lng,
             "accuracy_m": accuracy_m, "note": note, "photo_url": photo_url,
-            "user_id": user_id  # peut être None; si string -> CAST uuid
+            "user_id": user_id  # None → CAST(NULL AS uuid) = NULL ; sinon string uuid ok
         })
         report_id = res.scalar_one()
         await db.commit()
@@ -117,7 +115,7 @@ async def insert_report(
         await db.rollback()
         raise
 
-    # Actions auto (tolérance “rétabli à proximité” + incidents)
+    # 3) actions auto
     try:
         if signal == "restored" and kind in KINDS_OUTAGE:
             await close_nearest_outage_on_restored(db, kind, lat, lng)
@@ -131,7 +129,6 @@ async def insert_report(
         await db.commit()
     except Exception:
         await db.rollback()
-        # on n'annule pas le report si l'action auto échoue
 
     return report_id
 
