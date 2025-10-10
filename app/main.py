@@ -107,3 +107,25 @@ if os.getenv("ENV", "dev") == "dev":
     @app.get("/__routes")
     async def list_routes():
         return sorted([r.path for r in app.routes])
+
+import hashlib, pathlib, os
+
+def _sha(path):
+    p = pathlib.Path(path)
+    if not p.exists():
+        return None
+    return hashlib.sha1(p.read_bytes()).hexdigest()[:12]
+
+@app.get("/__version")
+async def version():
+    return {
+        "ENV": os.getenv("ENV"),
+        "SCHEDULER_ENABLED": os.getenv("SCHEDULER_ENABLED"),
+        "AGG_INTERVAL_MIN": os.getenv("AGG_INTERVAL_MIN"),
+        "files": {
+            "aggregation.py": _sha("app/services/aggregation.py"),
+            "crud.py": _sha("app/crud.py"),
+            "db.py": _sha("app/db.py"),
+            "main.py": _sha("app/main.py"),
+        }
+    }
