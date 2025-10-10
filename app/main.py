@@ -1,5 +1,5 @@
 # app/main.py
-import os
+
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+import os, re
 
 from app.db import get_db
 from app.services.aggregation import run_aggregation
@@ -58,19 +59,16 @@ app = FastAPI(title="Ayii API", lifespan=lifespan)
 
 # ---------- CORS ----------
 # Origin Netlify en prod + localhost pour le dev
-FRONT_ORIGIN = os.getenv("FRONT_ORIGIN", "https://ayii.netlify.app")
-origins = [
-    FRONT_ORIGIN,                # prod (Netlify)
-    "http://localhost:3000",     # dev local
-    "http://127.0.0.1:3000",     # dev local
-]
+FRONT_ORIGIN = os.getenv("FRONT_ORIGIN", "https://ayii.netlify.app").strip()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,       # mets ["*"] temporairement si besoin de tester
+    allow_origins=[FRONT_ORIGIN, "http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origin_regex=r"^https://[a-z0-9-]+\.netlify\.app$",   # autorise toutes les previews Netlify
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    
 )
 
 # ---------- Health ----------
@@ -104,3 +102,6 @@ app.include_router(dev_router)
 @app.get("/__routes")
 async def list_routes():
     return sorted([r.path for r in app.routes])
+
+if os.getenv("ENV", "dev") == "dev":
+    app.include_router(dev_router)
