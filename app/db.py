@@ -1,24 +1,25 @@
-# app/db.py  — Connexion directe Supabase (sans PgBouncer)
-import os, ssl, certifi
+# app/db.py  — Pooler 6543 (PgBouncer, mode transaction)
+import os, asyncpg
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.pool import NullPool
 
-# Nettoie la valeur (retire espaces/retours & query)
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip().split("?")[0]
-# Exemple attendu :
-# postgresql+asyncpg://postgres:Temya2025Secure@db.sdrczqseuhevmcjmjtep.supabase.co:5432/postgres
+RAW_URL = os.getenv("DATABASE_URL", "").strip()          # supprime espaces/retours
+DATABASE_URL = RAW_URL.split("?")[0]                     # retire toute query
+ASYNC_PG_DSN = DATABASE_URL.replace("postgresql+asyncpg://","postgresql://")
 
-# SSL strict requis par Supabase direct
-ssl_ctx = ssl.create_default_context()
-ssl_ctx.load_verify_locations(certifi.where())
-ssl_ctx.check_hostname = True
-ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+async def _asyncpg_connect():
+    return await asyncpg.connect(
+        dsn=ASYNC_PG_DSN,
+        statement_cache_size=0,            # 🔑 indispensable avec PgBouncer (transaction)
+        prepared_statement_cache_size=0,   # 🔑 idem
+        timeout=10.0,
+    )
 
 engine = create_async_engine(
     DATABASE_URL,
-    poolclass=NullPool,          # évite de retenir des connexions côté app
+    poolclass=NullPool,     # ne monopolise pas le pooler
     pool_pre_ping=True,
-    connect_args={"ssl": ssl_ctx}  # ✅ IMPORTANT: TLS vérifié
+    async_creator=_asyncpg_connect,  # 🔑 impose notre connecteur
 )
 
 SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)
