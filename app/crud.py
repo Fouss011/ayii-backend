@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+
 from sqlalchemy import text, bindparam
 from sqlalchemy.types import Float
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,9 +41,9 @@ KINDS_OUTAGE = {"power", "water"}
 INCIDENT_KINDS = {"traffic", "accident", "fire", "flood"}
 
 # rayon max qu’on “cherche” autour d’un point pour fermer une zone
-CLOSE_SEARCH_METERS = 3000
+CLOSE_SEARCH_METERS = 3000.0
 CLOSE_FACTOR = 1.5     # on accepte si dist <= 1.5 * radius
-CLOSE_HARDCAP = 1500   # ou si dist <= 1500 m
+CLOSE_HARDCAP = 1500.0 # ou si dist <= 1500 m
 
 
 # --- Inserts / Reports -----------------------------------------------------
@@ -67,7 +68,7 @@ async def insert_report(
       - restored sur incident_kinds => clear du plus proche
     """
     # Détecte le vrai type des colonnes (enum/text/etc.)
-    kind_typ = await get_column_typename(db, "reports", "kind")      # ex: outage_kind ou text
+    kind_typ = await get_column_typename(db, "reports", "kind")      # ex: report_kind ou text
     sig_typ  = await get_column_typename(db, "reports", "signal")    # ex: report_signal ou text
     kind_is_enum = await is_enum_typename(db, kind_typ)
     sig_is_enum  = await is_enum_typename(db, sig_typ)
@@ -122,13 +123,6 @@ async def insert_report(
 
 # --- Map / lecture ---------------------------------------------------------
 
-# --- Map / lecture ---------------------------------------------------------
-
-from sqlalchemy import text, bindparam
-from sqlalchemy.types import Float
-from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Any, Dict, Optional
-
 async def get_outages_in_radius(
     db: AsyncSession, lat: float, lng: float, radius_km: float
 ) -> Dict[str, Any]:
@@ -136,24 +130,22 @@ async def get_outages_in_radius(
 
     # Outages (ongoing/restored)
     q_outages = text("""
-    WITH me AS (
-      SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-    )
-    SELECT
-      id, kind, status,
-      ST_Y(center::geometry) AS lat,
-      ST_X(center::geometry) AS lng,
-      radius_m, started_at, restored_at
-    FROM outages
-    WHERE ST_DWithin(
-        center,
-        (SELECT g FROM me),
-        CAST(:meters AS double precision) + radius_m
-    )
-    ORDER BY started_at DESC
-""").bindparams(bindparam("meters", type_=Float))
-
-
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+        )
+        SELECT
+          id, kind, status,
+          ST_Y(center::geometry) AS lat,
+          ST_X(center::geometry) AS lng,
+          radius_m, started_at, restored_at, label_override
+        FROM outages
+        WHERE ST_DWithin(
+            center,
+            (SELECT g FROM me),
+            CAST(:meters AS double precision) + radius_m
+        )
+        ORDER BY started_at DESC
+    """).bindparams(bindparam("meters", type_=Float))
 
     out_res = await db.execute(q_outages, {"lat": lat, "lng": lng, "meters": meters})
     outages = [
@@ -165,7 +157,7 @@ async def get_outages_in_radius(
             "radius_m": int(r.radius_m),
             "started_at": r.started_at,
             "restored_at": r.restored_at,
-            
+            "label_override": r.label_override,
         }
         for r in out_res.fetchall()
     ]
@@ -243,10 +235,6 @@ async def get_outages_in_radius(
 
 # --- Fermeture tolérante des zones (rétabli) -------------------------------
 
-CLOSE_SEARCH_METERS = 3000.0
-CLOSE_FACTOR = 1.5
-CLOSE_HARDCAP = 1500.0
-
 async def close_nearest_outage_on_restored(
     db: AsyncSession, kind: str, lat: float, lng: float
 ) -> Optional[str]:
@@ -262,7 +250,7 @@ async def close_nearest_outage_on_restored(
           SELECT id, radius_m,
                  ST_Distance(center, (SELECT g FROM me)) AS dist
             FROM outages
-           WHERE kind=:kind AND status='ongoing'
+           WHERE kind::text = :kind AND status='ongoing'    -- << cast text
              AND ST_DWithin(center, (SELECT g FROM me), CAST(:search_m AS double precision))
            ORDER BY center::geometry <-> (SELECT g::geometry FROM me)
            LIMIT 1
@@ -307,7 +295,7 @@ async def upsert_incident_from_report(
         cand AS (
           SELECT id
             FROM incidents
-           WHERE kind=:kind AND active=true
+           WHERE kind::text = :kind AND active=true    -- << cast text
              AND ST_DWithin(center, (SELECT g FROM me), CAST(500 AS double precision))
            ORDER BY center::geometry <-> (SELECT g::geometry FROM me)
            LIMIT 1
@@ -340,7 +328,7 @@ async def clear_nearest_incident(
         cand AS (
           SELECT id
             FROM incidents
-           WHERE kind=:kind AND active=true
+           WHERE kind::text = :kind AND active=true   -- << cast text
              AND ST_DWithin(center, (SELECT g FROM me), CAST(800 AS double precision))
            ORDER BY center::geometry <-> (SELECT g::geometry FROM me)
            LIMIT 1
@@ -370,8 +358,8 @@ async def expire_stale_outages(db: AsyncSession) -> None:
            AND NOT EXISTS (
                 SELECT 1
                   FROM reports r
-                 WHERE r.kind = o.kind
-                   AND r.signal = 'cut'
+                 WHERE r.kind::text = o.kind::text         -- << cast text
+                   AND r.signal::text = 'cut'              -- << cast text
                    AND r.created_at >= NOW() - INTERVAL '45 minutes'
                    AND ST_DWithin(r.geom::geography, o.center, (o.radius_m * 1.5)::double precision)
            )
@@ -387,10 +375,10 @@ async def expire_incidents(db: AsyncSession) -> None:
            SET active=false, cleared_at=COALESCE(cleared_at, NOW())
          WHERE active=true
            AND (
-                (kind='traffic'  AND NOW()-last_report_at > INTERVAL '45 minutes') OR
-                (kind='accident' AND NOW()-last_report_at > INTERVAL '3 hours')  OR
-                (kind='fire'     AND NOW()-last_report_at > INTERVAL '4 hours')  OR
-                (kind='flood'    AND NOW()-last_report_at > INTERVAL '24 hours')
+                (kind::text='traffic'  AND NOW()-last_report_at > INTERVAL '45 minutes') OR
+                (kind::text='accident' AND NOW()-last_report_at > INTERVAL '3 hours')  OR
+                (kind::text='fire'     AND NOW()-last_report_at > INTERVAL '4 hours')  OR
+                (kind::text='flood'    AND NOW()-last_report_at > INTERVAL '24 hours')
            )
     """)
     await db.execute(q)
