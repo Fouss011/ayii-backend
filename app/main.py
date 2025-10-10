@@ -58,9 +58,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Ayii API", lifespan=lifespan)
 
 # ---------- CORS ----------
-# ---------- CORS ----------
+"""
 from fastapi.middleware.cors import CORSMiddleware
-
 
 # ⚠️ MODE DIAG: ouverture totale pour vérifier le CORS (TEMPORAIRE)
 # Quand c'est bon, repasse au bloc "STRICT" en-dessous.
@@ -77,6 +76,8 @@ app.add_middleware(
 """
 # ---------- (après validation) MODE STRICT ----------
 # Dé-commente ce bloc et supprime le bloc "DIAG" ci-dessus.
+from fastapi.middleware.cors import CORSMiddleware
+FRONT_ORIGIN = (os.getenv("FRONT_ORIGIN", "https://ayii.netlify.app") or "").strip()
 
 app.add_middleware(
     CORSMiddleware,
@@ -88,7 +89,7 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=86400,
 )
-"""
+
 
 # ---------- Health ----------
 @app.get("/health")
