@@ -59,10 +59,8 @@ app = FastAPI(title="Ayii API", lifespan=lifespan)
 
 # ---------- CORS ----------
 
-from fastapi.middleware.cors import CORSMiddleware
-import os
+FRONT_ORIGIN = (os.getenv("FRONT_ORIGIN", "https://ayii.netlify.app") or "").strip().rstrip("/")
 
-FRONT_ORIGIN = (os.getenv("FRONT_ORIGIN", "https://ayii.netlify.app") or "").strip()
 
 # Autoriser prod nette + previews Netlify + localhost
 NETLIFY_REGEX = r"^https://[a-z0-9-]+(\-\-[a-z0-9-]+)?\.netlify\.app$"
