@@ -1,10 +1,14 @@
 # app/routes/map.py
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
 from app.db import get_db
-from app.crud import get_outages_in_radius
+import os
 
 router = APIRouter()
+
+POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "60"))   # durée d'affichage des derniers reports
+MAX_REPORTS = int(os.getenv("MAX_REPORTS", "300"))              # limite de sécurité
 
 @router.get("/map")
 async def map_endpoint(
@@ -14,6 +18,123 @@ async def map_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        return await get_outages_in_radius(db, lat, lng, radius_km)
+        radius_m = int(radius_km * 1000)
+
+        # centre geom
+        # NB: on utilise le centre paramétré pour les 3 sélections,
+        #     pas de filtre par user_id -> TOUT LE MONDE VOIT TOUT.
+        params = {
+            "lat": lat,
+            "lng": lng,
+            "radius_m": radius_m,
+            "win": POINTS_WINDOW_MIN,
+            "max_reports": MAX_REPORTS,
+        }
+
+        # ---- OUTAGES (zones power/water) ----
+        q_outages = text("""
+            WITH center AS (
+              SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+            )
+            SELECT
+              o.id,
+              o.kind::text      AS kind,
+              o.status::text    AS status,
+              ST_Y(o.center::geometry) AS lat,
+              ST_X(o.center::geometry) AS lng,
+              o.radius_m,
+              o.started_at,
+              o.restored_at,
+              o.label_override
+            FROM outages o, center c
+            WHERE ST_DWithin(o.center, c.g, :radius_m)
+            ORDER BY
+              (o.status = 'ongoing') DESC,
+              o.started_at DESC
+        """)
+        res_out = await db.execute(q_outages, params)
+        outages = [
+            {
+                "id": r.id,
+                "kind": r.kind,
+                "status": r.status,
+                "center": {"lat": r.lat, "lng": r.lng},
+                "radius_m": r.radius_m,
+                "started_at": r.started_at,
+                "restored_at": r.restored_at,
+                "label_override": r.label_override,
+            }
+            for r in res_out
+        ]
+
+        # ---- INCIDENTS (traffic/accident/fire/flood) ----
+        q_inc = text("""
+            WITH center AS (
+              SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+            )
+            SELECT
+              i.id,
+              i.kind::text AS kind,
+              i.active,
+              ST_Y(i.center::geometry) AS lat,
+              ST_X(i.center::geometry) AS lng,
+              i.started_at,
+              i.last_cut_at,
+              i.ended_at
+            FROM incidents i, center c
+            WHERE ST_DWithin(i.center, c.g, :radius_m)
+            ORDER BY i.started_at DESC
+        """)
+        res_inc = await db.execute(q_inc, params)
+        incidents = [
+            {
+                "id": r.id,
+                "kind": r.kind,
+                "active": r.active,
+                "center": {"lat": r.lat, "lng": r.lng},
+                "started_at": r.started_at,
+                "last_cut_at": r.last_cut_at,
+                "ended_at": r.ended_at,
+            }
+            for r in res_inc
+        ]
+
+        # ---- LAST REPORTS (derniers points, tout le monde, sans filtre user) ----
+        q_rep = text("""
+            WITH center AS (
+              SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+            )
+            SELECT
+              r.id,
+              r.kind::text   AS kind,
+              r.signal::text AS signal,
+              ST_Y(r.geom::geometry) AS lat,
+              ST_X(r.geom::geometry) AS lng,
+              r.created_at
+            FROM reports r, center c
+            WHERE r.created_at >= now() - ( :win || ' minutes')::interval
+              AND ST_DWithin(r.geom::geography, c.g, :radius_m)
+            ORDER BY r.created_at DESC
+            LIMIT :max_reports
+        """)
+        res_rep = await db.execute(q_rep, params)
+        last_reports = [
+            {
+                "id": r.id,
+                "kind": r.kind,
+                "signal": r.signal,
+                "lat": r.lat,
+                "lng": r.lng,
+                "created_at": r.created_at,
+            }
+            for r in res_rep
+        ]
+
+        return {
+            "outages": outages,
+            "incidents": incidents,
+            "last_reports": last_reports,
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

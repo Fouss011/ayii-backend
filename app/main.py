@@ -145,3 +145,13 @@ async def version():
             "main.py": _sha("app/main.py"),
         }
     }
+
+from fastapi import Response, Request
+
+@app.middleware("http")
+async def no_store_cache(request: Request, call_next):
+    response: Response = await call_next(request)
+    # seulement pour /map
+    if request.url.path == "/map":
+        response.headers["Cache-Control"] = "no-store"
+    return response
