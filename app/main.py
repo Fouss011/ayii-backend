@@ -100,6 +100,7 @@ async def health():
 from app.routes.report import router as report_router
 from app.routes.map import router as map_router
 from app.routes.dev import router as dev_router
+from app.routes.admin import router as admin_router
 
 # optionnels si présents
 try:
@@ -116,6 +117,7 @@ except Exception:
 
 app.include_router(report_router)
 app.include_router(map_router)
+app.include_router(admin_router)
 
 # 👉 n’activer /dev/* qu’en dev
 if os.getenv("ENV", "dev") == "dev":

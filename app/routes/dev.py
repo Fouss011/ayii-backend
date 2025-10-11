@@ -106,5 +106,18 @@ async def ping_db_safe():
             content={"ok": False, "where": "sqlalchemy/connect", "error": f"{type(e).__name__}: {e}"}
         )
 
+# app/routes/dev.py (ajoute)
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.db import get_db
+from sqlalchemy import text
+
+@router.get("/health-deep")
+async def health_deep(db: AsyncSession = Depends(get_db)):
+    try:
+        r = await db.execute(text("SELECT now() as now"))
+        now = r.fetchone().now
+    except Exception as e:
+        return {"ok": False, "db": str(e)}
+    return {"ok": True, "db_now": str(now)}
 
 
