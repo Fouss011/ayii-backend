@@ -60,36 +60,28 @@ app = FastAPI(title="Ayii API", lifespan=lifespan)
 # ---------- CORS ----------
 
 from fastapi.middleware.cors import CORSMiddleware
+import os
 
-# ⚠️ MODE DIAG: ouverture totale pour vérifier le CORS (TEMPORAIRE)
-# Quand c'est bon, repasse au bloc "STRICT" en-dessous.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],          # <- TEMPORAIRE
-    allow_credentials=False,      # <- OBLIGATOIRE si "*" (sinon CORS invalide)
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=86400,
-)
-
-"""
-# ---------- (après validation) MODE STRICT ----------
-# Dé-commente ce bloc et supprime le bloc "DIAG" ci-dessus.
-from fastapi.middleware.cors import CORSMiddleware
 FRONT_ORIGIN = (os.getenv("FRONT_ORIGIN", "https://ayii.netlify.app") or "").strip()
 
+# Autoriser prod nette + previews Netlify + localhost
+NETLIFY_REGEX = r"^https://[a-z0-9-]+(\-\-[a-z0-9-]+)?\.netlify\.app$"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONT_ORIGIN, "https://ayii.netlify.app"],  # prod
-    allow_origin_regex=r"^https://[a-z0-9-]+\.netlify\.app$",  # previews
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=[
+        FRONT_ORIGIN,                # ex: https://ayii.netlify.app
+        "https://ayii.netlify.app",  # garde-fou au cas où FRONT_ORIGIN est mal saisi
+        "http://localhost:3000",     # dev local
+    ],
+    allow_origin_regex=NETLIFY_REGEX,  # couvre deploy-preview-123--... etc.
+    allow_credentials=True,            # autorisé car on n'utilise pas "*"
+    allow_methods=["GET", "POST", "OPTIONS"],  # explicite
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=86400,
 )
-"""
+
 
 # ---------- Health ----------
 @app.get("/health")
