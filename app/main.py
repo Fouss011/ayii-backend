@@ -57,6 +57,11 @@ async def lifespan(app: FastAPI):
 # Tu peux changer le titre si tu veux
 app = FastAPI(title="Ayii API", lifespan=lifespan)
 
+# après app = FastAPI(...)
+tok = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
+print(f"[admin-token] len={len(tok)} head={tok[:4]} tail={tok[-4:]}")  # juste pour debug
+
+
 # ---------- CORS ----------
 
 FRONT_ORIGIN = (os.getenv("FRONT_ORIGIN", "https://ayii.netlify.app") or "").strip().rstrip("/")
