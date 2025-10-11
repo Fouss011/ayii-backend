@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Ayii API", lifespan=lifespan)
 
 # ---------- CORS ----------
-"""
+
 from fastapi.middleware.cors import CORSMiddleware
 
 # ⚠️ MODE DIAG: ouverture totale pour vérifier le CORS (TEMPORAIRE)
@@ -89,7 +89,7 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=86400,
 )
-
+"""
 
 # ---------- Health ----------
 @app.get("/health")
