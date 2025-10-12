@@ -1,15 +1,15 @@
 # app/routes/map.py
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text, bindparam
-from sqlalchemy.types import Float
+from sqlalchemy import text
 from app.db import get_db
 import os
 
 router = APIRouter()
 
-POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))   # durée d'affichage des derniers reports
-MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))        # limite de sécurité
+# Durées et limites (surchargeables via variables d'env)
+POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))   # minutes d'affichage des derniers reports
+MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))         # limite sécurité
 
 @router.get("/map")
 async def map_endpoint(
@@ -20,16 +20,7 @@ async def map_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        # Position
-        q_me = text("""
-            SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
-        """)
-        res_me = await db.execute(q_me, {"lng": float(lng), "lat": float(lat)})
-        me = res_me.fetchone()
-        if not me:
-            raise HTTPException(status_code=400, detail="Invalid lat/lng")
-
-        # Outages (zones d'impact: power/water)
+        # --- Outages (zones power/water) ---
         q_outages = text("""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -41,7 +32,9 @@ async def map_endpoint(
              WHERE ST_DWithin(center, (SELECT g FROM me), :r)
              ORDER BY started_at DESC
         """)
-        res_out = await db.execute(q_outages, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)})
+        res_out = await db.execute(q_outages, {
+            "lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)
+        })
         outages = [
             {
                 "id": r.id,
@@ -55,7 +48,7 @@ async def map_endpoint(
             for r in res_out.fetchall()
         ]
 
-        # Incidents (traffic/accident/fire/flood)
+        # --- Incidents (traffic/accident/fire/flood) ---
         q_inc = text("""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -67,7 +60,9 @@ async def map_endpoint(
              WHERE ST_DWithin(center, (SELECT g FROM me), :r)
              ORDER BY started_at DESC
         """)
-        res_inc = await db.execute(q_inc, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)})
+        res_inc = await db.execute(q_inc, {
+            "lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)
+        })
         incidents = [
             {
                 "id": r.id,
@@ -81,7 +76,7 @@ async def map_endpoint(
             for r in res_inc.fetchall()
         ]
 
-        # Derniers reports
+        # --- Derniers reports (fenêtre glissante) ---
         q_rep = text(f"""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -95,7 +90,9 @@ async def map_endpoint(
              ORDER BY created_at DESC
              LIMIT :max
         """)
-        res_rep = await db.execute(q_rep, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0), "max": MAX_REPORTS})
+        res_rep = await db.execute(q_rep, {
+            "lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0), "max": MAX_REPORTS
+        })
         last_reports = [
             {
                 "id": r.id,
