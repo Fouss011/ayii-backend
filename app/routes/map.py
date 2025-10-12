@@ -1,5 +1,5 @@
 # app/routes/map.py
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text, bindparam
 from sqlalchemy.types import Float
@@ -15,108 +15,87 @@ MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))        # limite de séc
 async def map_endpoint(
     lat: float = Query(..., ge=-90, le=90),
     lng: float = Query(..., ge=-180, le=180),
-    radius_km: float = Query(5.0, gt=0, le=100),
+    radius_km: float = Query(5.0, gt=0, le=50),
+    response: Response = None,
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        radius_m = float(radius_km * 1000.0)
+        # Position
+        q_me = text("""
+            SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+        """)
+        res_me = await db.execute(q_me, {"lng": float(lng), "lat": float(lat)})
+        me = res_me.fetchone()
+        if not me:
+            raise HTTPException(status_code=400, detail="Invalid lat/lng")
 
-        params = {
-            "lat": lat,
-            "lng": lng,
-            "radius_m": radius_m,
-            "win": POINTS_WINDOW_MIN,
-            "max_reports": MAX_REPORTS,
-        }
-
-        # ---- OUTAGES (zones power/water) ----
+        # Outages (zones d'impact: power/water)
         q_outages = text("""
-            WITH center AS (
+            WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
             )
-            SELECT
-              o.id,
-              o.kind::text      AS kind,
-              o.status::text    AS status,
-              ST_Y(o.center::geometry) AS lat,
-              ST_X(o.center::geometry) AS lng,
-              o.radius_m,
-              o.started_at,
-              o.restored_at,
-              o.label_override
-            FROM outages o, center c
-            WHERE ST_DWithin(o.center, c.g, CAST(:radius_m AS double precision))
-            ORDER BY
-              (o.status = 'ongoing') DESC,
-              o.started_at DESC
-        """).bindparams(bindparam("radius_m", type_=Float))
-        res_out = await db.execute(q_outages, params)
+            SELECT id, kind::text AS kind, status::text AS status,
+                   ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
+                   started_at, restored_at
+              FROM outages
+             WHERE ST_DWithin(center, (SELECT g FROM me), :r)
+             ORDER BY started_at DESC
+        """)
+        res_out = await db.execute(q_outages, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)})
         outages = [
             {
                 "id": r.id,
                 "kind": r.kind,
                 "status": r.status,
-                "center": {"lat": float(r.lat), "lng": float(r.lng)},
-                "radius_m": int(r.radius_m),
+                "lat": float(r.lat),
+                "lng": float(r.lng),
                 "started_at": r.started_at,
                 "restored_at": r.restored_at,
-                "label_override": r.label_override,
             }
             for r in res_out.fetchall()
         ]
 
-        # ---- INCIDENTS (uniquement actifs) ----
+        # Incidents (traffic/accident/fire/flood)
         q_inc = text("""
-            WITH center AS (
+            WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
             )
-            SELECT
-              i.id,
-              i.kind::text AS kind,
-              i.active,
-              ST_Y(i.center::geometry) AS lat,
-              ST_X(i.center::geometry) AS lng,
-              i.started_at,
-              i.last_cut_at,
-              i.ended_at
-            FROM incidents i, center c
-            WHERE i.active = true
-              AND ST_DWithin(i.center, c.g, CAST(:radius_m AS double precision))
-            ORDER BY i.started_at DESC
-        """).bindparams(bindparam("radius_m", type_=Float))
-        res_inc = await db.execute(q_inc, params)
+            SELECT id, kind::text AS kind, status::text AS status,
+                   ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
+                   started_at, restored_at
+              FROM incidents
+             WHERE ST_DWithin(center, (SELECT g FROM me), :r)
+             ORDER BY started_at DESC
+        """)
+        res_inc = await db.execute(q_inc, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)})
         incidents = [
             {
                 "id": r.id,
                 "kind": r.kind,
-                "active": r.active,
-                "center": {"lat": float(r.lat), "lng": float(r.lng)},
+                "status": r.status,
+                "lat": float(r.lat),
+                "lng": float(r.lng),
                 "started_at": r.started_at,
-                "last_cut_at": r.last_cut_at,
-                "ended_at": r.ended_at,
+                "restored_at": r.restored_at,
             }
             for r in res_inc.fetchall()
         ]
 
-        # ---- LAST REPORTS (derniers points, tout le monde) ----
-        q_rep = text("""
-            WITH center AS (
+        # Derniers reports
+        q_rep = text(f"""
+            WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
             )
-            SELECT
-              r.id,
-              r.kind::text   AS kind,
-              r.signal::text AS signal,
-              ST_Y(r.geom::geometry) AS lat,
-              ST_X(r.geom::geometry) AS lng,
-              r.created_at
-            FROM reports r, center c
-            WHERE r.created_at >= now() - ( :win || ' minutes')::interval
-              AND ST_DWithin(r.geom::geography, c.g, CAST(:radius_m AS double precision))
-            ORDER BY r.created_at DESC
-            LIMIT :max_reports
-        """).bindparams(bindparam("radius_m", type_=Float))
-        res_rep = await db.execute(q_rep, params)
+            SELECT id, kind::text AS kind, signal::text AS signal,
+                   ST_Y(geo::geometry) AS lat, ST_X(geo::geometry) AS lng,
+                   user_id, created_at
+              FROM reports
+             WHERE ST_DWithin(geo, (SELECT g FROM me), :r)
+               AND created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
+             ORDER BY created_at DESC
+             LIMIT :max
+        """)
+        res_rep = await db.execute(q_rep, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0), "max": MAX_REPORTS})
         last_reports = [
             {
                 "id": r.id,
@@ -124,16 +103,22 @@ async def map_endpoint(
                 "signal": r.signal,
                 "lat": float(r.lat),
                 "lng": float(r.lng),
+                "user_id": r.user_id,
                 "created_at": r.created_at,
             }
             for r in res_rep.fetchall()
         ]
 
-        return {
+        payload = {
             "outages": outages,
             "incidents": incidents,
             "last_reports": last_reports,
+            "server_now": __import__("datetime").datetime.utcnow().isoformat() + "Z",
         }
+        if response is not None:
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return payload
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
