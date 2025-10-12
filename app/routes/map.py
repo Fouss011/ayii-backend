@@ -1,14 +1,15 @@
 # app/routes/map.py
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
+from sqlalchemy.types import Float
 from app.db import get_db
 import os
 
 router = APIRouter()
 
 POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "60"))   # durée d'affichage des derniers reports
-MAX_REPORTS = int(os.getenv("MAX_REPORTS", "300"))              # limite de sécurité
+MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "300"))        # limite de sécurité
 
 @router.get("/map")
 async def map_endpoint(
@@ -18,11 +19,8 @@ async def map_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        radius_m = int(radius_km * 1000)
+        radius_m = float(radius_km * 1000.0)
 
-        # centre geom
-        # NB: on utilise le centre paramétré pour les 3 sélections,
-        #     pas de filtre par user_id -> TOUT LE MONDE VOIT TOUT.
         params = {
             "lat": lat,
             "lng": lng,
@@ -47,27 +45,27 @@ async def map_endpoint(
               o.restored_at,
               o.label_override
             FROM outages o, center c
-            WHERE ST_DWithin(o.center, c.g, :radius_m)
+            WHERE ST_DWithin(o.center, c.g, CAST(:radius_m AS double precision))
             ORDER BY
               (o.status = 'ongoing') DESC,
               o.started_at DESC
-        """)
+        """).bindparams(bindparam("radius_m", type_=Float))
         res_out = await db.execute(q_outages, params)
         outages = [
             {
                 "id": r.id,
                 "kind": r.kind,
                 "status": r.status,
-                "center": {"lat": r.lat, "lng": r.lng},
-                "radius_m": r.radius_m,
+                "center": {"lat": float(r.lat), "lng": float(r.lng)},
+                "radius_m": int(r.radius_m),
                 "started_at": r.started_at,
                 "restored_at": r.restored_at,
                 "label_override": r.label_override,
             }
-            for r in res_out
+            for r in res_out.fetchall()
         ]
 
-        # ---- INCIDENTS (traffic/accident/fire/flood) ----
+        # ---- INCIDENTS (uniquement actifs) ----
         q_inc = text("""
             WITH center AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -82,24 +80,25 @@ async def map_endpoint(
               i.last_cut_at,
               i.ended_at
             FROM incidents i, center c
-            WHERE ST_DWithin(i.center, c.g, :radius_m)
+            WHERE i.active = true
+              AND ST_DWithin(i.center, c.g, CAST(:radius_m AS double precision))
             ORDER BY i.started_at DESC
-        """)
+        """).bindparams(bindparam("radius_m", type_=Float))
         res_inc = await db.execute(q_inc, params)
         incidents = [
             {
                 "id": r.id,
                 "kind": r.kind,
                 "active": r.active,
-                "center": {"lat": r.lat, "lng": r.lng},
+                "center": {"lat": float(r.lat), "lng": float(r.lng)},
                 "started_at": r.started_at,
                 "last_cut_at": r.last_cut_at,
                 "ended_at": r.ended_at,
             }
-            for r in res_inc
+            for r in res_inc.fetchall()
         ]
 
-        # ---- LAST REPORTS (derniers points, tout le monde, sans filtre user) ----
+        # ---- LAST REPORTS (derniers points, tout le monde) ----
         q_rep = text("""
             WITH center AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -113,21 +112,21 @@ async def map_endpoint(
               r.created_at
             FROM reports r, center c
             WHERE r.created_at >= now() - ( :win || ' minutes')::interval
-              AND ST_DWithin(r.geom::geography, c.g, :radius_m)
+              AND ST_DWithin(r.geom::geography, c.g, CAST(:radius_m AS double precision))
             ORDER BY r.created_at DESC
             LIMIT :max_reports
-        """)
+        """).bindparams(bindparam("radius_m", type_=Float))
         res_rep = await db.execute(q_rep, params)
         last_reports = [
             {
                 "id": r.id,
                 "kind": r.kind,
                 "signal": r.signal,
-                "lat": r.lat,
-                "lng": r.lng,
+                "lat": float(r.lat),
+                "lng": float(r.lng),
                 "created_at": r.created_at,
             }
-            for r in res_rep
+            for r in res_rep.fetchall()
         ]
 
         return {

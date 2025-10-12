@@ -1,8 +1,8 @@
 # app/crud.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
 import os
+from typing import Any, Dict, Optional
 
 from sqlalchemy import text, bindparam
 from sqlalchemy.types import Float
@@ -51,6 +51,7 @@ CLOSE_HARDCAP = 1500.0
 
 # Fenêtre d’historique des reports dans /map (minutes)
 POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))
+MAX_REPORTS = int(os.getenv("MAX_REPORTS", "300"))
 
 # TTL conservateur incidents (minutes) – utilisé par expire_incidents()
 MIN_INCIDENT_LIFETIME_MIN = int(os.getenv("MIN_INCIDENT_LIFETIME_MIN", "60"))
@@ -146,7 +147,7 @@ async def get_outages_in_radius(
 ) -> Dict[str, Any]:
     meters = float(radius_km * 1000.0)
 
-    # Outages (ongoing/restored)
+    # Outages (zones power/water)
     q_outages = text("""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
@@ -157,8 +158,8 @@ async def get_outages_in_radius(
           ST_X(center::geometry) AS lng,
           radius_m, started_at, restored_at, label_override
         FROM outages
-        WHERE ST_DWithin(center, (SELECT g FROM me), CAST(:meters AS double precision) + radius_m)
-        ORDER BY started_at DESC
+        WHERE ST_DWithin(center, (SELECT g FROM me), CAST(:meters AS double precision))
+        ORDER BY (status = 'ongoing') DESC, started_at DESC
     """).bindparams(bindparam("meters", type_=Float))
 
     out_res = await db.execute(q_outages, {"lat": lat, "lng": lng, "meters": meters})
@@ -176,7 +177,7 @@ async def get_outages_in_radius(
         for r in out_res.fetchall()
     ]
 
-    # Derniers reports (fenêtre temps + rayon)
+    # Derniers reports (fenêtre + rayon)
     q_last = text(f"""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
@@ -191,7 +192,7 @@ async def get_outages_in_radius(
         WHERE created_at >= NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
           AND ST_DWithin(geom, (SELECT g FROM me), CAST(:meters AS double precision))
         ORDER BY created_at DESC
-        LIMIT 200
+        LIMIT {MAX_REPORTS}
     """).bindparams(bindparam("meters", type_=Float))
 
     last_res = await db.execute(q_last, {"lat": lat, "lng": lng, "meters": meters})
@@ -208,19 +209,19 @@ async def get_outages_in_radius(
         for r in last_res.fetchall()
     ]
 
-    # Incidents actifs (schéma réel: started_at / ended_at / last_cut_at)
+    # Incidents actifs
     q_inc = text("""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
         )
-        SELECT id, kind, active,
-               ST_Y(center::geometry) AS lat,
-               ST_X(center::geometry) AS lng,
-               started_at, ended_at, last_cut_at
-          FROM incidents
-         WHERE active = true
-           AND ST_DWithin(center, (SELECT g FROM me), CAST(:meters AS double precision))
-         ORDER BY started_at DESC
+        SELECT i.id, i.kind, i.active,
+               ST_Y(i.center::geometry) AS lat,
+               ST_X(i.center::geometry) AS lng,
+               i.started_at, i.ended_at, i.last_cut_at
+          FROM incidents i
+         WHERE i.active = true
+           AND ST_DWithin(i.center, (SELECT g FROM me), CAST(:meters AS double precision))
+         ORDER BY i.started_at DESC
     """).bindparams(bindparam("meters", type_=Float))
 
     inc_res = await db.execute(q_inc, {"lat": lat, "lng": lng, "meters": meters})
