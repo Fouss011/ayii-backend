@@ -1,89 +1,124 @@
 # app/routes/map.py
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text, bindparam
+from sqlalchemy.types import Float
 from app.db import get_db
-from sqlalchemy import text
+import os
 
 router = APIRouter()
 
+POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))   # durée d'affichage des derniers reports
+MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))        # limite de sécurité
+
 @router.get("/map")
-async def get_map(
-    lat: float = Query(...),
-    lng: float = Query(...),
-    radius_km: float = Query(5.0)
+async def map_endpoint(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    radius_km: float = Query(5.0, gt=0, le=50),
+    response: Response = None,
+    db: AsyncSession = Depends(get_db),
 ):
     try:
-        async with get_db() as db:  # récupère la session
-            meters = radius_km * 1000.0
+        # Position
+        q_me = text("""
+            SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+        """)
+        res_me = await db.execute(q_me, {"lng": float(lng), "lat": float(lat)})
+        me = res_me.fetchone()
+        if not me:
+            raise HTTPException(status_code=400, detail="Invalid lat/lng")
 
-            # Outages (zones)
-            sql_outages = text("""
-                WITH me AS (
-                  SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-                )
-                SELECT
-                  id, kind, status,
-                  ST_Y(center::geometry) AS lat,
-                  ST_X(center::geometry) AS lng,
-                  radius_m, started_at, restored_at, label_override
-                FROM outages
-                WHERE ST_DWithin(center, (SELECT g FROM me), :meters + radius_m)
-                ORDER BY started_at DESC
-            """)
-            res_out = await db.execute(sql_outages, {"lat": lat, "lng": lng, "meters": meters})
-            outages = [
-                {
-                    "id": r.id,
-                    "kind": r.kind,
-                    "status": r.status,
-                    "center": {"lat": r.lat, "lng": r.lng},
-                    "radius_m": r.radius_m,
-                    "started_at": r.started_at,
-                    "restored_at": r.restored_at,
-                    "label_override": r.label_override,
-                }
-                for r in res_out
-            ]
+        # Outages (zones d'impact: power/water)
+        q_outages = text("""
+            WITH me AS (
+              SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+            )
+            SELECT id, kind::text AS kind, status::text AS status,
+                   ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
+                   started_at, restored_at
+              FROM outages
+             WHERE ST_DWithin(center, (SELECT g FROM me), :r)
+             ORDER BY started_at DESC
+        """)
+        res_out = await db.execute(q_outages, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)})
+        outages = [
+            {
+                "id": r.id,
+                "kind": r.kind,
+                "status": r.status,
+                "lat": float(r.lat),
+                "lng": float(r.lng),
+                "started_at": r.started_at,
+                "restored_at": r.restored_at,
+            }
+            for r in res_out.fetchall()
+        ]
 
-            # Last reports
-            sql_reports = text("""
-                SELECT id, kind, signal,
-                       ST_Y(geom::geometry) AS lat,
-                       ST_X(geom::geometry) AS lng,
-                       created_at, user_id
-                FROM reports
-                WHERE created_at > now() - interval '12 hours'
-                ORDER BY created_at DESC
-                LIMIT 200
-            """)
-            res_rep = await db.execute(sql_reports)
-            last_reports = [dict(r._mapping) for r in res_rep]
+        # Incidents (traffic/accident/fire/flood)
+        q_inc = text("""
+            WITH me AS (
+              SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+            )
+            SELECT id, kind::text AS kind, status::text AS status,
+                   ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
+                   started_at, restored_at
+              FROM incidents
+             WHERE ST_DWithin(center, (SELECT g FROM me), :r)
+             ORDER BY started_at DESC
+        """)
+        res_inc = await db.execute(q_inc, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)})
+        incidents = [
+            {
+                "id": r.id,
+                "kind": r.kind,
+                "status": r.status,
+                "lat": float(r.lat),
+                "lng": float(r.lng),
+                "started_at": r.started_at,
+                "restored_at": r.restored_at,
+            }
+            for r in res_inc.fetchall()
+        ]
 
-            # Incidents
-            sql_incidents = text("""
-                SELECT id, kind, active,
-                       ST_Y(center::geometry) AS lat,
-                       ST_X(center::geometry) AS lng,
-                       created_at, last_report_at, cleared_at
-                FROM incidents
-                WHERE active = true
-                ORDER BY created_at DESC
-            """)
-            res_inc = await db.execute(sql_incidents)
-            incidents = [
-                {
-                    "id": r.id,
-                    "kind": r.kind,
-                    "active": r.active,
-                    "center": {"lat": r.lat, "lng": r.lng},
-                    "created_at": r.created_at,
-                    "last_report_at": r.last_report_at,
-                    "cleared_at": r.cleared_at,
-                }
-                for r in res_inc
-            ]
+        # Derniers reports
+        q_rep = text(f"""
+            WITH me AS (
+              SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+            )
+            SELECT id, kind::text AS kind, signal::text AS signal,
+                   ST_Y(geo::geometry) AS lat, ST_X(geo::geometry) AS lng,
+                   user_id, created_at
+              FROM reports
+             WHERE ST_DWithin(geo, (SELECT g FROM me), :r)
+               AND created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
+             ORDER BY created_at DESC
+             LIMIT :max
+        """)
+        res_rep = await db.execute(q_rep, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0), "max": MAX_REPORTS})
+        last_reports = [
+            {
+                "id": r.id,
+                "kind": r.kind,
+                "signal": r.signal,
+                "lat": float(r.lat),
+                "lng": float(r.lng),
+                "user_id": r.user_id,
+                "created_at": r.created_at,
+            }
+            for r in res_rep.fetchall()
+        ]
 
-            return {"outages": outages, "last_reports": last_reports, "incidents": incidents}
+        payload = {
+            "outages": outages,
+            "incidents": incidents,
+            "last_reports": last_reports,
+            "server_now": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        }
+        if response is not None:
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return payload
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
