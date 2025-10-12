@@ -7,9 +7,8 @@ import os
 
 router = APIRouter()
 
-# Durées et limites (surchargeables via variables d'env)
-POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))   # minutes d'affichage des derniers reports
-MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))         # limite sécurité
+POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))
+MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))
 
 @router.get("/map")
 async def map_endpoint(
@@ -20,21 +19,24 @@ async def map_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        # --- Outages (zones power/water) ---
+        # --- Outages (power/water) — status calculé depuis restored_at ---
         q_outages = text("""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
             )
-            SELECT id, kind::text AS kind, status::text AS status,
-                   ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
-                   started_at, restored_at
-              FROM outages
-             WHERE ST_DWithin(center, (SELECT g FROM me), :r)
-             ORDER BY started_at DESC
+            SELECT
+              id,
+              kind::text AS kind,
+              CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+              ST_Y(center::geometry) AS lat,
+              ST_X(center::geometry) AS lng,
+              started_at,
+              restored_at
+            FROM outages
+            WHERE ST_DWithin(center, (SELECT g FROM me), :r)
+            ORDER BY started_at DESC
         """)
-        res_out = await db.execute(q_outages, {
-            "lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)
-        })
+        res_out = await db.execute(q_outages, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)})
         outages = [
             {
                 "id": r.id,
@@ -48,21 +50,24 @@ async def map_endpoint(
             for r in res_out.fetchall()
         ]
 
-        # --- Incidents (traffic/accident/fire/flood) ---
+        # --- Incidents (traffic/accident/fire/flood) — status calculé idem ---
         q_inc = text("""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
             )
-            SELECT id, kind::text AS kind, status::text AS status,
-                   ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
-                   started_at, restored_at
-              FROM incidents
-             WHERE ST_DWithin(center, (SELECT g FROM me), :r)
-             ORDER BY started_at DESC
+            SELECT
+              id,
+              kind::text AS kind,
+              CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+              ST_Y(center::geometry) AS lat,
+              ST_X(center::geometry) AS lng,
+              started_at,
+              restored_at
+            FROM incidents
+            WHERE ST_DWithin(center, (SELECT g FROM me), :r)
+            ORDER BY started_at DESC
         """)
-        res_inc = await db.execute(q_inc, {
-            "lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)
-        })
+        res_inc = await db.execute(q_inc, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)})
         incidents = [
             {
                 "id": r.id,
@@ -81,18 +86,21 @@ async def map_endpoint(
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
             )
-            SELECT id, kind::text AS kind, signal::text AS signal,
-                   ST_Y(geo::geometry) AS lat, ST_X(geo::geometry) AS lng,
-                   user_id, created_at
-              FROM reports
-             WHERE ST_DWithin(geo, (SELECT g FROM me), :r)
-               AND created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
-             ORDER BY created_at DESC
-             LIMIT :max
+            SELECT
+              id,
+              kind::text AS kind,
+              signal::text AS signal,
+              ST_Y(geo::geometry) AS lat,
+              ST_X(geo::geometry) AS lng,
+              user_id,
+              created_at
+            FROM reports
+            WHERE ST_DWithin(geo, (SELECT g FROM me), :r)
+              AND created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
+            ORDER BY created_at DESC
+            LIMIT :max
         """)
-        res_rep = await db.execute(q_rep, {
-            "lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0), "max": MAX_REPORTS
-        })
+        res_rep = await db.execute(q_rep, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0), "max": MAX_REPORTS})
         last_reports = [
             {
                 "id": r.id,
