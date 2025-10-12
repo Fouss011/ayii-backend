@@ -11,7 +11,6 @@ POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))
 MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))
 
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
-    # Essai complet (avec started_at / restored_at)
     q_full = text("""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -28,7 +27,6 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
         WHERE ST_DWithin(center, (SELECT g FROM me), :r)
         ORDER BY started_at DESC
     """)
-    # Fallback minimal (si colonnes absentes)
     q_min = text("""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -48,9 +46,14 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
     except Exception as e:
-        if "UndefinedColumn" not in str(e):
+        # Si une colonne manque, il faut ROLLBACK avant de retenter
+        if "UndefinedColumn" in str(e) or "does not exist" in str(e):
+            await db.rollback()
+            res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
+        else:
+            # Autre erreur : rollback et remonter
+            await db.rollback()
             raise
-        res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
     rows = res.fetchall()
     return [
         {
@@ -101,9 +104,12 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
     except Exception as e:
-        if "UndefinedColumn" not in str(e):
+        if "UndefinedColumn" in str(e) or "does not exist" in str(e):
+            await db.rollback()
+            res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
+        else:
+            await db.rollback()
             raise
-        res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
     rows = res.fetchall()
     return [
         {
@@ -127,12 +133,17 @@ async def map_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     try:
+        # Par précaution : si une requête précédente a avorté, nettoie la session
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
         r_m = float(radius_km * 1000.0)
 
         outages = await fetch_outages(db, lat, lng, r_m)
         incidents = await fetch_incidents(db, lat, lng, r_m)
 
-        # reports (garde la version "complète" — normalement created_at/geo existent)
         q_rep = text(f"""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -151,7 +162,13 @@ async def map_endpoint(
             ORDER BY created_at DESC
             LIMIT :max
         """)
-        res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
+        # Si une transaction précédente a échoué, s'assurer d'être "clean"
+        try:
+            res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
+        except Exception:
+            await db.rollback()
+            res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
+
         last_reports = [
             {
                 "id": r.id,
@@ -177,4 +194,9 @@ async def map_endpoint(
         return payload
 
     except Exception as e:
+        # Dernière sécurité : rollback pour ne pas laisser la session dans un mauvais état
+        try:
+            await db.rollback()
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
