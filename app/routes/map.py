@@ -8,8 +8,8 @@ import os
 
 router = APIRouter()
 
-POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "60"))   # durée d'affichage des derniers reports
-MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "300"))        # limite de sécurité
+POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))   # durée d'affichage des derniers reports
+MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))        # limite de sécurité
 
 @router.get("/map")
 async def map_endpoint(
