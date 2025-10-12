@@ -4,23 +4,21 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.crud import expire_stale_outages, expire_incidents
 
-# ---- Paramètres pilotés par ENV (modifiables sur Render) ----
-CUT_WINDOW_HOURS          = int(os.getenv("CUT_WINDOW_HOURS", "3"))       # fenêtre pour re-open & clustering
-CLUSTER_GRID_DEG          = float(os.getenv("CLUSTER_GRID_DEG", "0.003")) # ~300–330m
-MIN_REPORTS               = int(os.getenv("MIN_REPORTS", "2"))            # nb de "cut" pour créer une zone
-DEFAULT_RADIUS_M          = int(os.getenv("DEFAULT_RADIUS_M", "350"))
-MERGE_DISTANCE_M          = int(os.getenv("MERGE_DISTANCE_M", "400"))
-RESTORE_WINDOW_HOURS      = int(os.getenv("RESTORE_WINDOW_HOURS", "6"))
-COOLDOWN_AFTER_RESTORE_MIN= int(os.getenv("COOLDOWN_AFTER_RESTORE_MIN", "10"))
+# Flags/env de stabilité
+AUTO_EXPIRE_ENABLED = os.getenv("AUTO_EXPIRE_ENABLED", "1") != "0"
+LOG_AGG = os.getenv("LOG_AGG", "0") == "1"
 
-# Nouveaux paramètres de stabilité
-MIN_INCIDENT_LIFETIME_MIN = int(os.getenv("MIN_INCIDENT_LIFETIME_MIN", "20"))
-MIN_OUTAGE_LIFETIME_MIN   = int(os.getenv("MIN_OUTAGE_LIFETIME_MIN", "20"))
-RESTORE_CONFIRMATIONS     = int(os.getenv("RESTORE_CONFIRMATIONS", "2"))
-OUTAGE_TTL_MIN            = int(os.getenv("OUTAGE_TTL_MIN", "180"))
+# Paramètres
+CUT_WINDOW_HOURS = 3
+CLUSTER_GRID_DEG = 0.003     # ~300–330m
+MIN_REPORTS = 2
+DEFAULT_RADIUS_M = 350
+MERGE_DISTANCE_M = 400
+RESTORE_WINDOW_HOURS = 6
+COOLDOWN_AFTER_RESTORE_MIN = 10
 
 async def run_aggregation(db: AsyncSession):
-    # 0) RE-OPEN : si des "cut" récents réapparaissent près d'une zone restaurée
+    # 0) Re-open: un nouveau "cut" près d'une zone restaurée -> repasse en ongoing
     reopen_sql = text(f"""
         WITH recent_cut AS (
             SELECT kind, geom::geography AS g, created_at
@@ -45,36 +43,34 @@ async def run_aggregation(db: AsyncSession):
                        )
            );
     """)
-    await db.execute(reopen_sql)
+    res = await db.execute(reopen_sql)
+    if LOG_AGG: print(f"[agg] reopen outages -> {res.rowcount}")
     await db.commit()
 
-    # 1) CLOSE OUTAGES (power/water) — confirmations + âge minimum + TTL dur
-    close_outages_sql = text(f"""
+    # 1) Close par "restored" récents
+    close_sql = text(f"""
         UPDATE outages o
            SET status = 'restored',
                restored_at = COALESCE(o.restored_at, now())
          WHERE o.status = 'ongoing'
-           AND (
-                -- Règle principale : assez de confirmations + âge minimum
-                (
-                  (SELECT COUNT(*)
-                     FROM reports r
-                    WHERE r.kind::text = o.kind::text
-                      AND r.signal::text = 'restored'
-                      AND r.created_at >= o.started_at
-                      AND ST_DWithin(r.geom::geography, o.center, o.radius_m)
-                  ) >= {RESTORE_CONFIRMATIONS}
-                  AND now() - o.started_at >= interval '{MIN_OUTAGE_LIFETIME_MIN} minutes'
-                )
-                OR
-                -- TTL dur (sécurité)
-                (now() - o.started_at >= interval '{OUTAGE_TTL_MIN} minutes')
+           AND EXISTS (
+                SELECT 1
+                  FROM reports r
+                 WHERE r.kind::text   = o.kind::text
+                   AND r.signal::text = 'restored'
+                   AND r.created_at > now() - interval '{RESTORE_WINDOW_HOURS} hours'
+                   AND ST_DWithin(
+                         r.geom::geography,
+                         o.center,
+                         LEAST(o.radius_m, 300)
+                       )
            );
     """)
-    await db.execute(close_outages_sql)
+    res = await db.execute(close_sql)
+    if LOG_AGG: print(f"[agg] close outages (restore) -> {res.rowcount}")
     await db.commit()
 
-    # 2) CREATE OUTAGES — clustering des "cut" récents
+    # 2) Création de zones par clustering de "cut" récents
     create_sql = text(f"""
         WITH recent AS (
             SELECT kind, geom::geometry AS g
@@ -94,11 +90,11 @@ async def run_aggregation(db: AsyncSession):
         )
         INSERT INTO outages (kind, status, center, radius_m, started_at)
         SELECT
-            CAST(c.kind::text AS outage_kind),
-            'ongoing',
-            ST_SetSRID(c.center_geom, 4326)::geography,
-            {DEFAULT_RADIUS_M},
-            now()
+            CAST(c.kind::text AS outage_kind)
+          , 'ongoing'
+          , ST_SetSRID(c.center_geom, 4326)::geography
+          , {DEFAULT_RADIUS_M}
+          , now()
           FROM clusters c
          WHERE NOT EXISTS (
                 SELECT 1
@@ -124,29 +120,18 @@ async def run_aggregation(db: AsyncSession):
                        )
            );
     """)
-    await db.execute(create_sql)
+    res = await db.execute(create_sql)
+    if LOG_AGG: print(f"[agg] create outages (clusters) -> {res.rowcount}")
     await db.commit()
 
-    # 3) CLOSE INCIDENTS (traffic/accident/fire/flood) — grace period + restored proche
-    close_incidents_sql = text(f"""
-        UPDATE incidents i
-           SET active = FALSE,
-               ended_at = COALESCE(i.ended_at, now())
-         WHERE i.active = TRUE
-           AND now() - COALESCE(i.last_cut_at, i.started_at) >= interval '{MIN_INCIDENT_LIFETIME_MIN} minutes'
-           AND EXISTS (
-                SELECT 1
-                  FROM reports r
-                 WHERE r.kind::text = i.kind::text
-                   AND r.signal::text = 'restored'
-                   AND r.created_at >= COALESCE(i.last_cut_at, i.started_at)
-                   AND ST_DWithin(r.geom::geography, i.center, 800)
-           );
-    """)
-    await db.execute(close_incidents_sql)
-    await db.commit()
-
-    # 4) Expirations/housekeeping complémentaires (si tu en as besoin en plus des règles ci-dessus)
-    await expire_stale_outages(db)
-    await expire_incidents(db)
-    await db.commit()
+    # 4) Expirations / housekeeping (désactivables)
+    if AUTO_EXPIRE_ENABLED:
+        c1 = await expire_stale_outages(db)
+        c2 = await expire_incidents(db)
+        if LOG_AGG:
+            if c1 is not None: print(f"[agg] expire_stale_outages -> {c1}")
+            if c2 is not None: print(f"[agg] expire_incidents -> {c2}")
+        await db.commit()
+    else:
+        if LOG_AGG:
+            print("[agg] auto-expire disabled (AUTO_EXPIRE_ENABLED=0)")
