@@ -10,6 +10,114 @@ router = APIRouter()
 POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))
 MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))
 
+async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
+    # Essai complet (avec started_at / restored_at)
+    q_full = text("""
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+        )
+        SELECT
+          id,
+          kind::text AS kind,
+          CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+          ST_Y(center::geometry) AS lat,
+          ST_X(center::geometry) AS lng,
+          started_at,
+          restored_at
+        FROM outages
+        WHERE ST_DWithin(center, (SELECT g FROM me), :r)
+        ORDER BY started_at DESC
+    """)
+    # Fallback minimal (si colonnes absentes)
+    q_min = text("""
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+        )
+        SELECT
+          id,
+          kind::text AS kind,
+          'active' AS status,
+          ST_Y(center::geometry) AS lat,
+          ST_X(center::geometry) AS lng,
+          NULL::timestamp AS started_at,
+          NULL::timestamp AS restored_at
+        FROM outages
+        WHERE ST_DWithin(center, (SELECT g FROM me), :r)
+        ORDER BY id DESC
+    """)
+    try:
+        res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
+    except Exception as e:
+        if "UndefinedColumn" not in str(e):
+            raise
+        res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
+    rows = res.fetchall()
+    return [
+        {
+            "id": r.id,
+            "kind": r.kind,
+            "status": r.status,
+            "lat": float(r.lat),
+            "lng": float(r.lng),
+            "started_at": getattr(r, "started_at", None),
+            "restored_at": getattr(r, "restored_at", None),
+        }
+        for r in rows
+    ]
+
+async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
+    q_full = text("""
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+        )
+        SELECT
+          id,
+          kind::text AS kind,
+          CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+          ST_Y(center::geometry) AS lat,
+          ST_X(center::geometry) AS lng,
+          started_at,
+          restored_at
+        FROM incidents
+        WHERE ST_DWithin(center, (SELECT g FROM me), :r)
+        ORDER BY started_at DESC
+    """)
+    q_min = text("""
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
+        )
+        SELECT
+          id,
+          kind::text AS kind,
+          'active' AS status,
+          ST_Y(center::geometry) AS lat,
+          ST_X(center::geometry) AS lng,
+          NULL::timestamp AS started_at,
+          NULL::timestamp AS restored_at
+        FROM incidents
+        WHERE ST_DWithin(center, (SELECT g FROM me), :r)
+        ORDER BY id DESC
+    """)
+    try:
+        res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
+    except Exception as e:
+        if "UndefinedColumn" not in str(e):
+            raise
+        res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
+    rows = res.fetchall()
+    return [
+        {
+            "id": r.id,
+            "kind": r.kind,
+            "status": r.status,
+            "lat": float(r.lat),
+            "lng": float(r.lng),
+            "started_at": getattr(r, "started_at", None),
+            "restored_at": getattr(r, "restored_at", None),
+        }
+        for r in rows
+    ]
+
 @router.get("/map")
 async def map_endpoint(
     lat: float = Query(..., ge=-90, le=90),
@@ -19,69 +127,12 @@ async def map_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        # --- Outages (power/water) — status calculé depuis restored_at ---
-        q_outages = text("""
-            WITH me AS (
-              SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
-            )
-            SELECT
-              id,
-              kind::text AS kind,
-              CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-              ST_Y(center::geometry) AS lat,
-              ST_X(center::geometry) AS lng,
-              started_at,
-              restored_at
-            FROM outages
-            WHERE ST_DWithin(center, (SELECT g FROM me), :r)
-            ORDER BY started_at DESC
-        """)
-        res_out = await db.execute(q_outages, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)})
-        outages = [
-            {
-                "id": r.id,
-                "kind": r.kind,
-                "status": r.status,
-                "lat": float(r.lat),
-                "lng": float(r.lng),
-                "started_at": r.started_at,
-                "restored_at": r.restored_at,
-            }
-            for r in res_out.fetchall()
-        ]
+        r_m = float(radius_km * 1000.0)
 
-        # --- Incidents (traffic/accident/fire/flood) — status calculé idem ---
-        q_inc = text("""
-            WITH me AS (
-              SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
-            )
-            SELECT
-              id,
-              kind::text AS kind,
-              CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-              ST_Y(center::geometry) AS lat,
-              ST_X(center::geometry) AS lng,
-              started_at,
-              restored_at
-            FROM incidents
-            WHERE ST_DWithin(center, (SELECT g FROM me), :r)
-            ORDER BY started_at DESC
-        """)
-        res_inc = await db.execute(q_inc, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0)})
-        incidents = [
-            {
-                "id": r.id,
-                "kind": r.kind,
-                "status": r.status,
-                "lat": float(r.lat),
-                "lng": float(r.lng),
-                "started_at": r.started_at,
-                "restored_at": r.restored_at,
-            }
-            for r in res_inc.fetchall()
-        ]
+        outages = await fetch_outages(db, lat, lng, r_m)
+        incidents = await fetch_incidents(db, lat, lng, r_m)
 
-        # --- Derniers reports (fenêtre glissante) ---
+        # reports (garde la version "complète" — normalement created_at/geo existent)
         q_rep = text(f"""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -100,7 +151,7 @@ async def map_endpoint(
             ORDER BY created_at DESC
             LIMIT :max
         """)
-        res_rep = await db.execute(q_rep, {"lng": float(lng), "lat": float(lat), "r": float(radius_km * 1000.0), "max": MAX_REPORTS})
+        res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
         last_reports = [
             {
                 "id": r.id,
