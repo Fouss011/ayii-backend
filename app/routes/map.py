@@ -46,12 +46,10 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
     except Exception as e:
-        # Si une colonne manque, il faut ROLLBACK avant de retenter
         if "UndefinedColumn" in str(e) or "does not exist" in str(e):
             await db.rollback()
             res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
         else:
-            # Autre erreur : rollback et remonter
             await db.rollback()
             raise
     rows = res.fetchall()
@@ -133,7 +131,7 @@ async def map_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        # Par précaution : si une requête précédente a avorté, nettoie la session
+        # nettoie une éventuelle transaction abortée
         try:
             await db.rollback()
         except Exception:
@@ -144,6 +142,7 @@ async def map_endpoint(
         outages = await fetch_outages(db, lat, lng, r_m)
         incidents = await fetch_incidents(db, lat, lng, r_m)
 
+        # --- REPORTS : utilise la colonne geom (pas geo), cast en geography pour la distance
         q_rep = text(f"""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -152,17 +151,16 @@ async def map_endpoint(
               id,
               kind::text AS kind,
               signal::text AS signal,
-              ST_Y(geo::geometry) AS lat,
-              ST_X(geo::geometry) AS lng,
+              ST_Y(geom::geometry) AS lat,
+              ST_X(geom::geometry) AS lng,
               user_id,
               created_at
             FROM reports
-            WHERE ST_DWithin(geo, (SELECT g FROM me), :r)
+            WHERE ST_DWithin(geom::geography, (SELECT g FROM me), :r)
               AND created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
             ORDER BY created_at DESC
             LIMIT :max
         """)
-        # Si une transaction précédente a échoué, s'assurer d'être "clean"
         try:
             res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
         except Exception:
@@ -194,7 +192,6 @@ async def map_endpoint(
         return payload
 
     except Exception as e:
-        # Dernière sécurité : rollback pour ne pas laisser la session dans un mauvais état
         try:
             await db.rollback()
         except Exception:
