@@ -1,5 +1,6 @@
 # app/routes/map.py
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from app.db import get_db
@@ -7,9 +8,15 @@ import os
 
 router = APIRouter()
 
+# Fenêtre et limites d'affichage des "reports"
 POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))
 MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))
 
+# Rayon (mètres) utilisé pour trouver l’élément à marquer "restored"
+RESTORE_RADIUS_M  = int(os.getenv("RESTORE_RADIUS_M", "200"))
+
+
+# ---------- Helpers DB (lecture) ----------
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
     q_full = text("""
         WITH me AS (
@@ -65,6 +72,7 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
         }
         for r in rows
     ]
+
 
 async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
     q_full = text("""
@@ -122,6 +130,8 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
         for r in rows
     ]
 
+
+# ---------- Endpoint: GET /map ----------
 @router.get("/map")
 async def map_endpoint(
     lat: float = Query(..., ge=-90, le=90),
@@ -197,3 +207,110 @@ async def map_endpoint(
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------- Modèle d’entrée pour /report ----------
+class ReportIn(BaseModel):
+    kind: str            # "power" | "water" | "traffic" | "accident" | "fire" | "flood"
+    signal: str          # "cut" | "restored"
+    lat: float
+    lng: float
+    user_id: str | None = None
+
+
+# ---------- Endpoint: POST /report ----------
+@router.post("/report")
+async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
+    """
+    1) Log dans reports (geom geography)
+    2) Si signal='restored' → marque l'élément le plus proche comme rétabli (incidents ou outages)
+    """
+    try:
+        # 1) journaliser
+        await db.execute(
+            text("""
+                INSERT INTO reports(kind, signal, geom, user_id, created_at)
+                VALUES (:kind, :signal,
+                        ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                        :user_id, NOW())
+            """),
+            {"kind": p.kind, "signal": p.signal, "lat": p.lat, "lng": p.lng, "user_id": p.user_id}
+        )
+
+        # 2) si restored -> UPDATE table ciblée
+        if p.signal == "restored":
+            target_table = "outages" if p.kind in ("power", "water") else "incidents"
+            await db.execute(
+                text(f"""
+                    WITH me AS (
+                      SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+                    )
+                    UPDATE {target_table}
+                       SET restored_at = NOW()
+                     WHERE restored_at IS NULL
+                       AND kind = :kind
+                       AND ST_DWithin(center, (SELECT g FROM me), :r)
+                """),
+                {"lng": p.lng, "lat": p.lat, "kind": p.kind, "r": RESTORE_RADIUS_M}
+            )
+
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        try:
+            await db.rollback()
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=f"report failed: {e}")
+
+
+# ---------- Endpoint: POST /reset_user ----------
+@router.post("/reset_user")
+async def reset_user(id: str = Query(..., alias="id"), db: AsyncSession = Depends(get_db)):
+    """
+    Supprime tous les reports de cet utilisateur (UUID ou TEXT).
+    Double tentative pour éviter les erreurs de cast UUID.
+    """
+    try:
+        q1 = text("DELETE FROM reports WHERE user_id = :id")
+        try:
+            await db.execute(q1, {"id": id})
+        except Exception:
+            # si user_id est UUID strict, retente avec cast explicite
+            q2 = text("DELETE FROM reports WHERE user_id = :id::uuid")
+            await db.execute(q2, {"id": id})
+
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        try:
+            await db.rollback()
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=f"reset_user failed: {e}")
+
+
+# ---------- Endpoint: POST /admin/force_cleanup (optionnel) ----------
+@router.post("/admin/force_cleanup")
+async def admin_force_cleanup(db: AsyncSession = Depends(get_db)):
+    """
+    Marque tout comme rétabli + purge l'historique de reports.
+    À protéger par auth côté router si nécessaire.
+    """
+    try:
+        await db.execute(text("ALTER TABLE incidents ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
+        await db.execute(text("ALTER TABLE outages   ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
+
+        await db.execute(text("UPDATE incidents SET restored_at = NOW() WHERE restored_at IS NULL"))
+        await db.execute(text("UPDATE outages   SET restored_at = NOW() WHERE restored_at IS NULL"))
+
+        await db.execute(text("DELETE FROM reports"))
+
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        try:
+            await db.rollback()
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=f"cleanup failed: {e}")
