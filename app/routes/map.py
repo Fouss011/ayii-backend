@@ -13,6 +13,7 @@ router = APIRouter()
 POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))
 MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))
 RESTORE_RADIUS_M  = int(os.getenv("RESTORE_RADIUS_M", "200"))  # fallback large si besoin
+CLEANUP_RADIUS_M  = int(os.getenv("CLEANUP_RADIUS_M", "80"))   # rayon pour supprimer les reports 'cut' proches
 ADMIN_TOKEN       = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
 
 def _check_admin_token(request: Request):
@@ -192,12 +193,14 @@ class ReportIn(BaseModel):
 async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
     """
     1) Insère le report.
-    2) Si signal='restored', marque comme rétabli l'élément le PLUS PROCHE (par id), sinon fallback rayon large.
+    2) Si signal='restored':
+       - marque comme rétabli l'élément le PLUS PROCHE (incidents/outages),
+       - supprime les reports 'cut' proches du clic (même kind), d'abord pour le même user_id, sinon tous.
     """
     try:
         sig = "restored" if str(p.signal).lower().strip() == "restored" else "cut"
 
-        # 1) log report
+        # 1) Journaliser le report
         await db.execute(
             text("""
                 INSERT INTO reports(kind, signal, geom, user_id, created_at)
@@ -208,13 +211,11 @@ async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
             {"kind": p.kind, "signal": sig, "lat": p.lat, "lng": p.lng, "user_id": p.user_id}
         )
 
-        # 2) restored => update nearest
         if sig == "restored":
+            # 2a) Restaurer l’élément le plus proche (par id)
             target_table = "outages" if p.kind in ("power", "water") else "incidents"
-            # s'assurer que la colonne existe
             await db.execute(text(f"ALTER TABLE {target_table} ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
 
-            # chercher l'id le plus proche
             res_nearest = await db.execute(
                 text(f"""
                     WITH me AS (
@@ -230,22 +231,52 @@ async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
                 {"lng": p.lng, "lat": p.lat, "kind": p.kind}
             )
             row = res_nearest.first()
-
             if row and row[0] is not None:
                 await db.execute(text(f"UPDATE {target_table} SET restored_at = NOW() WHERE id = :id"), {"id": row[0]})
             else:
-                # fallback rayon large
+                # fallback: rayon large si aucun nearest trouvé
                 await db.execute(
                     text(f"""
-                        WITH me AS (
-                          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-                        )
+                        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                         UPDATE {target_table}
                            SET restored_at = NOW()
                          WHERE kind = :kind
                            AND ST_DWithin(center, (SELECT g FROM me), :r)
                     """),
                     {"lng": p.lng, "lat": p.lat, "kind": p.kind, "r": max(RESTORE_RADIUS_M, 1000)}
+                )
+
+            # 2b) SUPPRIMER les reports 'cut' proches (même kind)
+            #    - priorité: même user_id (en gérant les NULL via IS NOT DISTINCT FROM)
+            del_same_user = await db.execute(
+                text("""
+                    WITH me AS (
+                      SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+                    )
+                    DELETE FROM reports r
+                    WHERE LOWER(TRIM(r.signal::text))='cut'
+                      AND r.kind = :kind
+                      AND ST_DWithin(r.geom::geography, (SELECT g FROM me), :dr)
+                      AND (r.user_id IS NOT DISTINCT FROM :uid)
+                    RETURNING id
+                """),
+                {"lng": p.lng, "lat": p.lat, "kind": p.kind, "dr": CLEANUP_RADIUS_M, "uid": p.user_id}
+            )
+            deleted_rows = del_same_user.fetchall()
+
+            if len(deleted_rows) == 0:
+                # si rien pour ce user, supprime quand même les 'cut' proches (quel que soit l'user)
+                await db.execute(
+                    text("""
+                        WITH me AS (
+                          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+                        )
+                        DELETE FROM reports r
+                        WHERE LOWER(TRIM(r.signal::text))='cut'
+                          AND r.kind = :kind
+                          AND ST_DWithin(r.geom::geography, (SELECT g FROM me), :dr)
+                    """),
+                    {"lng": p.lng, "lat": p.lat, "kind": p.kind, "dr": CLEANUP_RADIUS_M}
                 )
 
         await db.commit()
@@ -310,7 +341,6 @@ async def admin_ensure_schema(db: AsyncSession = Depends(get_db)):
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"ensure_schema failed: {e}")
 
-# --- Normalisation & ménage des reports (legacy) ---
 @router.post("/admin/normalize_reports")
 async def admin_normalize_reports(db: AsyncSession = Depends(get_db)):
     """
