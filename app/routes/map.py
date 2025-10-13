@@ -356,8 +356,12 @@ async def admin_seed_incident(p: AdminCreateIn, db: AsyncSession = Depends(get_d
         await db.execute(
             text("""
                 INSERT INTO incidents(kind, center, started_at, restored_at)
-                VALUES (:kind, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                        COALESCE(:started_at::timestamp, NOW()), NULL)
+                VALUES (
+                  :kind,
+                  ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                  COALESCE(CAST(:started_at AS timestamp), NOW()),
+                  NULL
+                )
             """),
             {"kind": p.kind, "lat": p.lat, "lng": p.lng, "started_at": p.started_at}
         )
@@ -367,14 +371,19 @@ async def admin_seed_incident(p: AdminCreateIn, db: AsyncSession = Depends(get_d
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"seed_incident failed: {e}")
 
+
 @router.post("/admin/seed_outage")
 async def admin_seed_outage(p: AdminCreateIn, db: AsyncSession = Depends(get_db)):
     try:
         await db.execute(
             text("""
                 INSERT INTO outages(kind, center, started_at, restored_at)
-                VALUES (:kind, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                        COALESCE(:started_at::timestamp, NOW()), NULL)
+                VALUES (
+                  :kind,
+                  ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                  COALESCE(CAST(:started_at AS timestamp), NOW()),
+                  NULL
+                )
             """),
             {"kind": p.kind, "lat": p.lat, "lng": p.lng, "started_at": p.started_at}
         )
@@ -383,6 +392,7 @@ async def admin_seed_outage(p: AdminCreateIn, db: AsyncSession = Depends(get_db)
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"seed_outage failed: {e}")
+
 
 @router.post("/admin/restore_near")
 async def admin_restore_near(p: AdminNearIn, db: AsyncSession = Depends(get_db)):
