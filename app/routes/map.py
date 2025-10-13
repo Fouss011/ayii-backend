@@ -1,5 +1,5 @@
 # app/routes/map.py
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -8,14 +8,19 @@ import os
 
 router = APIRouter()
 
-# Fenêtre et limites d'affichage des "reports"
+# --------- Config ----------
 POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))
 MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))
+RESTORE_RADIUS_M  = int(os.getenv("RESTORE_RADIUS_M", "200"))  # fallback large si besoin
+ADMIN_TOKEN       = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
 
-# Rayon (mètres) utilisé pour trouver l’élément à marquer "restored"
-RESTORE_RADIUS_M  = int(os.getenv("RESTORE_RADIUS_M", "200"))
+def _check_admin_token(request: Request):
+    if ADMIN_TOKEN:
+        tok = request.headers.get("x-admin-token", "")
+        if tok != ADMIN_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid admin token")
 
-# ---------- Helpers DB (lecture) ----------
+# --------- Helpers lecture ----------
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
     q_full = text("""
         WITH me AS (
@@ -128,7 +133,7 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
         for r in rows
     ]
 
-# ---------- Endpoint: GET /map ----------
+# --------- GET /map ----------
 @router.get("/map")
 async def map_endpoint(
     lat: float = Query(..., ge=-90, le=90),
@@ -168,11 +173,7 @@ async def map_endpoint(
             ORDER BY created_at DESC
             LIMIT :max
         """)
-        try:
-            res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
-        except Exception:
-            await db.rollback()
-            res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
+        res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
 
         last_reports = [
             {
@@ -205,7 +206,7 @@ async def map_endpoint(
             pass
         raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- Modèle d’entrée pour /report ----------
+# --------- POST /report ----------
 class ReportIn(BaseModel):
     kind: str            # "power" | "water" | "traffic" | "accident" | "fire" | "flood"
     signal: str          # "cut" | "restored"
@@ -213,15 +214,16 @@ class ReportIn(BaseModel):
     lng: float
     user_id: str | None = None
 
-# ---------- Endpoint: POST /report ----------
 @router.post("/report")
 async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
     """
-    1) Log dans reports (geom geography)
-    2) Si signal='restored' → marque l'élément le plus proche comme rétabli (incidents ou outages)
+    1) Insère le report.
+    2) Si signal='restored', marque comme rétabli l'élément le PLUS PROCHE (par id), sinon fallback rayon large.
     """
     try:
-        # journaliser
+        sig = "restored" if str(p.signal).lower() == "restored" else "cut"
+
+        # 1) log report
         await db.execute(
             text("""
                 INSERT INTO reports(kind, signal, geom, user_id, created_at)
@@ -229,28 +231,52 @@ async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
                         ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
                         :user_id, NOW())
             """),
-            {"kind": p.kind, "signal": p.signal, "lat": p.lat, "lng": p.lng, "user_id": p.user_id}
+            {"kind": p.kind, "signal": sig, "lat": p.lat, "lng": p.lng, "user_id": p.user_id}
         )
 
-        # si restored -> UPDATE table ciblée
-        if p.signal == "restored":
+        # 2) restored => update nearest
+        if sig == "restored":
             target_table = "outages" if p.kind in ("power", "water") else "incidents"
-            await db.execute(
+            # s'assurer que la colonne existe
+            await db.execute(text(f"ALTER TABLE {target_table} ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
+
+            # chercher l'id le plus proche
+            res_nearest = await db.execute(
                 text(f"""
                     WITH me AS (
                       SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
                     )
-                    UPDATE {target_table}
-                       SET restored_at = NOW()
-                     WHERE restored_at IS NULL
-                       AND kind = :kind
-                       AND ST_DWithin(center, (SELECT g FROM me), :r)
+                    SELECT id
+                    FROM {target_table}
+                    WHERE kind = :kind
+                      AND (restored_at IS NULL OR restored_at > NOW() - INTERVAL '100 years')
+                    ORDER BY center <-> (SELECT g FROM me)
+                    LIMIT 1
                 """),
-                {"lng": p.lng, "lat": p.lat, "kind": p.kind, "r": RESTORE_RADIUS_M}
+                {"lng": p.lng, "lat": p.lat, "kind": p.kind}
             )
+            row = res_nearest.first()
+
+            if row and row[0] is not None:
+                await db.execute(text(f"UPDATE {target_table} SET restored_at = NOW() WHERE id = :id"), {"id": row[0]})
+            else:
+                # fallback rayon large
+                await db.execute(
+                    text(f"""
+                        WITH me AS (
+                          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+                        )
+                        UPDATE {target_table}
+                           SET restored_at = NOW()
+                         WHERE kind = :kind
+                           AND ST_DWithin(center, (SELECT g FROM me), :r)
+                    """),
+                    {"lng": p.lng, "lat": p.lat, "kind": p.kind, "r": max(RESTORE_RADIUS_M, 1000)}
+                )
 
         await db.commit()
         return {"ok": True}
+
     except Exception as e:
         try:
             await db.rollback()
@@ -258,55 +284,159 @@ async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
             pass
         raise HTTPException(status_code=500, detail=f"report failed: {e}")
 
-# ---------- Endpoint: POST /reset_user ----------
+# --------- POST /reset_user ----------
 @router.post("/reset_user")
 async def reset_user(id: str = Query(..., alias="id"), db: AsyncSession = Depends(get_db)):
     """
     Supprime tous les reports de cet utilisateur (UUID ou TEXT).
-    Double tentative pour éviter les erreurs de cast UUID.
+    Double tentative si la colonne est de type uuid.
     """
     try:
-        q1 = text("DELETE FROM reports WHERE user_id = :id")
         try:
-            await db.execute(q1, {"id": id})
+            await db.execute(text("DELETE FROM reports WHERE user_id = :id"), {"id": id})
         except Exception:
-            # si user_id est UUID strict, retente avec cast explicite
-            q2 = text("DELETE FROM reports WHERE user_id = :id::uuid")
-            await db.execute(q2, {"id": id})
-
+            await db.execute(text("DELETE FROM reports WHERE user_id = :id::uuid"), {"id": id})
         await db.commit()
         return {"ok": True}
     except Exception as e:
-        try:
-            await db.rollback()
-        except:
-            pass
+        await db.rollback()
         raise HTTPException(status_code=500, detail=f"reset_user failed: {e}")
 
-# ---------- Endpoints admin maintenance ----------
-@router.post("/admin/force_cleanup")
-async def admin_force_cleanup(db: AsyncSession = Depends(get_db)):
-    """
-    Marque tout comme rétabli + purge l'historique de reports.
-    À protéger par auth côté router si nécessaire.
-    """
+# --------- ADMIN: maintenance ----------
+@router.post("/admin/wipe_all")
+async def admin_wipe_all(request: Request, truncate: bool = Query(False), db: AsyncSession = Depends(get_db)):
+    _check_admin_token(request)
+    try:
+        if truncate:
+            await db.execute(text("TRUNCATE TABLE reports RESTART IDENTITY CASCADE"))
+            await db.execute(text("TRUNCATE TABLE incidents RESTART IDENTITY CASCADE"))
+            await db.execute(text("TRUNCATE TABLE outages RESTART IDENTITY CASCADE"))
+        else:
+            await db.execute(text("DELETE FROM reports"))
+            await db.execute(text("DELETE FROM incidents"))
+            await db.execute(text("DELETE FROM outages"))
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"wipe_all failed: {e}")
+
+@router.post("/admin/ensure_schema")
+async def admin_ensure_schema(db: AsyncSession = Depends(get_db)):
     try:
         await db.execute(text("ALTER TABLE incidents ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
         await db.execute(text("ALTER TABLE outages   ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
-
-        await db.execute(text("UPDATE incidents SET restored_at = NOW() WHERE restored_at IS NULL"))
-        await db.execute(text("UPDATE outages   SET restored_at = NOW() WHERE restored_at IS NULL"))
-
-        await db.execute(text("DELETE FROM reports"))
-
+        await db.execute(text("CREATE INDEX IF NOT EXISTS idx_incidents_center ON incidents USING GIST ((center::geometry))"))
+        await db.execute(text("CREATE INDEX IF NOT EXISTS idx_outages_center   ON outages   USING GIST ((center::geometry))"))
+        await db.execute(text("CREATE INDEX IF NOT EXISTS idx_incidents_kind ON incidents(kind)"))
+        await db.execute(text("CREATE INDEX IF NOT EXISTS idx_outages_kind   ON outages(kind)"))
         await db.commit()
         return {"ok": True}
     except Exception as e:
-        try:
-            await db.rollback()
-        except:
-            pass
-        raise HTTPException(status_code=500, detail=f"cleanup failed: {e}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"ensure_schema failed: {e}")
+
+# seed & ops proximité
+from typing import Optional
+class AdminCreateIn(BaseModel):
+    kind: str
+    lat: float
+    lng: float
+    started_at: Optional[str] = None
+
+class AdminNearIn(BaseModel):
+    kind: str
+    lat: float
+    lng: float
+    radius_m: int = RESTORE_RADIUS_M
+
+@router.post("/admin/seed_incident")
+async def admin_seed_incident(p: AdminCreateIn, db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(
+            text("""
+                INSERT INTO incidents(kind, center, started_at, restored_at)
+                VALUES (:kind, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                        COALESCE(:started_at::timestamp, NOW()), NULL)
+            """),
+            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "started_at": p.started_at}
+        )
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"seed_incident failed: {e}")
+
+@router.post("/admin/seed_outage")
+async def admin_seed_outage(p: AdminCreateIn, db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(
+            text("""
+                INSERT INTO outages(kind, center, started_at, restored_at)
+                VALUES (:kind, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                        COALESCE(:started_at::timestamp, NOW()), NULL)
+            """),
+            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "started_at": p.started_at}
+        )
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"seed_outage failed: {e}")
+
+@router.post("/admin/restore_near")
+async def admin_restore_near(p: AdminNearIn, db: AsyncSession = Depends(get_db)):
+    try:
+        table = "outages" if p.kind in ("power", "water") else "incidents"
+        await db.execute(
+            text(f"""
+                WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+                UPDATE {table} SET restored_at = NOW()
+                WHERE kind = :kind AND ST_DWithin(center, (SELECT g FROM me), :r)
+            """),
+            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
+        )
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"restore_near failed: {e}")
+
+@router.post("/admin/unrestore_near")
+async def admin_unrestore_near(p: AdminNearIn, db: AsyncSession = Depends(get_db)):
+    try:
+        table = "outages" if p.kind in ("power", "water") else "incidents"
+        await db.execute(
+            text(f"""
+                WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+                UPDATE {table} SET restored_at = NULL
+                WHERE kind = :kind AND ST_DWithin(center, (SELECT g FROM me), :r)
+            """),
+            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
+        )
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"unrestore_near failed: {e}")
+
+@router.post("/admin/delete_near")
+async def admin_delete_near(p: AdminNearIn, db: AsyncSession = Depends(get_db)):
+    try:
+        table = "outages" if p.kind in ("power", "water") else "incidents"
+        await db.execute(
+            text(f"""
+                WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+                DELETE FROM {table}
+                WHERE kind = :kind AND ST_DWithin(center, (SELECT g FROM me), :r)
+            """),
+            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
+        )
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"delete_near failed: {e}")
 
 @router.post("/admin/clear_restored_reports")
 async def admin_clear_restored_reports(db: AsyncSession = Depends(get_db)):
@@ -337,167 +467,3 @@ async def admin_delete_report(id: int = Query(...), db: AsyncSession = Depends(g
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"delete_report failed: {e}")
-
-# ---------- Endpoints admin de seed/test ----------
-from typing import Optional
-
-class AdminCreateIn(BaseModel):
-    kind: str                 # "power" | "water" | "traffic" | "accident" | "fire" | "flood"
-    lat: float
-    lng: float
-    started_at: Optional[str] = None  # ISO optionnel
-
-class AdminNearIn(BaseModel):
-    kind: str
-    lat: float
-    lng: float
-    radius_m: int = RESTORE_RADIUS_M
-
-@router.post("/admin/seed_incident")
-async def admin_seed_incident(p: AdminCreateIn, db: AsyncSession = Depends(get_db)):
-    try:
-        await db.execute(
-            text("""
-                INSERT INTO incidents(kind, center, started_at, restored_at)
-                VALUES (
-                  :kind,
-                  ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                  COALESCE(:started_at::timestamp, NOW()),
-                  NULL
-                )
-            """),
-            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "started_at": p.started_at}
-        )
-        await db.commit()
-        return {"ok": True}
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"seed_incident failed: {e}")
-
-@router.post("/admin/seed_outage")
-async def admin_seed_outage(p: AdminCreateIn, db: AsyncSession = Depends(get_db)):
-    try:
-        await db.execute(
-            text("""
-                INSERT INTO outages(kind, center, started_at, restored_at)
-                VALUES (
-                  :kind,
-                  ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                  COALESCE(:started_at::timestamp, NOW()),
-                  NULL
-                )
-            """),
-            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "started_at": p.started_at}
-        )
-        await db.commit()
-        return {"ok": True}
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"seed_outage failed: {e}")
-
-@router.post("/admin/restore_near")
-async def admin_restore_near(p: AdminNearIn, db: AsyncSession = Depends(get_db)):
-    try:
-        table = "outages" if p.kind in ("power", "water") else "incidents"
-        await db.execute(
-            text(f"""
-                WITH me AS (
-                  SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-                )
-                UPDATE {table}
-                   SET restored_at = NOW()
-                 WHERE kind = :kind
-                   AND ST_DWithin(center, (SELECT g FROM me), :r)
-            """),
-            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
-        )
-        await db.commit()
-        return {"ok": True}
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"restore_near failed: {e}")
-
-@router.post("/admin/unrestore_near")
-async def admin_unrestore_near(p: AdminNearIn, db: AsyncSession = Depends(get_db)):
-    try:
-        table = "outages" if p.kind in ("power", "water") else "incidents"
-        await db.execute(
-            text(f"""
-                WITH me AS (
-                  SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-                )
-                UPDATE {table}
-                   SET restored_at = NULL
-                 WHERE kind = :kind
-                   AND ST_DWithin(center, (SELECT g FROM me), :r)
-            """),
-            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
-        )
-        await db.commit()
-        return {"ok": True}
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"unrestore_near failed: {e}")
-
-@router.post("/admin/delete_near")
-async def admin_delete_near(p: AdminNearIn, db: AsyncSession = Depends(get_db)):
-    try:
-        table = "outages" if p.kind in ("power", "water") else "incidents"
-        await db.execute(
-            text(f"""
-                WITH me AS (
-                  SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-                )
-                DELETE FROM {table}
-                 WHERE kind = :kind
-                   AND ST_DWithin(center, (SELECT g FROM me), :r)
-            """),
-            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
-        )
-        await db.commit()
-        return {"ok": True}
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"delete_near failed: {e}")
-
-# --- AJOUTER EN BAS DE app/routes/map.py ---
-from fastapi import Request
-
-ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
-
-def _check_admin_token(request: Request):
-    # Si un token est défini côté serveur, on le demande via header
-    if ADMIN_TOKEN:
-        tok = request.headers.get("x-admin-token", "")
-        if tok != ADMIN_TOKEN:
-            raise HTTPException(status_code=401, detail="Invalid admin token")
-
-@router.post("/admin/wipe_all")
-async def admin_wipe_all(
-    request: Request,
-    truncate: bool = Query(False, description="Si true: TRUNCATE + RESTART IDENTITY"),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Efface TOUT: reports + incidents + outages.
-    - truncate=false => DELETE FROM (préserve séquences)
-    - truncate=true  => TRUNCATE ... RESTART IDENTITY (remet les IDs à 1)
-    Protégé par x-admin-token si ADMIN_TOKEN est présent.
-    """
-    _check_admin_token(request)
-    try:
-        if truncate:
-            # reset total (IDs repris à 1)
-            await db.execute(text("TRUNCATE TABLE reports RESTART IDENTITY CASCADE"))
-            await db.execute(text("TRUNCATE TABLE incidents RESTART IDENTITY CASCADE"))
-            await db.execute(text("TRUNCATE TABLE outages RESTART IDENTITY CASCADE"))
-        else:
-            # supprime tout sans toucher aux séquences
-            await db.execute(text("DELETE FROM reports"))
-            await db.execute(text("DELETE FROM incidents"))
-            await db.execute(text("DELETE FROM outages"))
-        await db.commit()
-        return {"ok": True}
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"wipe_all failed: {e}")
