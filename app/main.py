@@ -1,5 +1,4 @@
 # app/main.py
-
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -7,17 +6,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-import os, re
+import os
 
 from app.db import get_db
 from app.services.aggregation import run_aggregation
 
+# Charger .env en local
 if os.getenv("RENDER") is None and os.getenv("ENV", "dev") == "dev":
     load_dotenv()
 
 scheduler = AsyncIOScheduler()
-
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -27,9 +25,8 @@ async def lifespan(app: FastAPI):
         interval = int(os.getenv("AGG_INTERVAL_MIN", "2"))
 
         async def job():
-            # ouvre proprement une session via get_db()
-            agen = get_db()                 # get_db est un async generator
-            db = await agen.__anext__()     # récupère une AsyncSession
+            agen = get_db()                 # async generator
+            db = await agen.__anext__()     # AsyncSession
             try:
                 await run_aggregation(db)
             except Exception as e:
@@ -40,7 +37,8 @@ async def lifespan(app: FastAPI):
                 except Exception:
                     pass
 
-        scheduler.add_job(job, trigger=IntervalTrigger(minutes=interval), id="ayii_agg", replace_existing=True)
+        scheduler.add_job(job, trigger=IntervalTrigger(minutes=interval),
+                          id="ayii_agg", replace_existing=True)
         scheduler.start()
         print(f"[scheduler] started (every {interval} min)")
     else:
@@ -54,37 +52,30 @@ async def lifespan(app: FastAPI):
         print("[scheduler] stopped")
 
 
-# Tu peux changer le titre si tu veux
 app = FastAPI(title="Ayii API", lifespan=lifespan)
 
-# après app = FastAPI(...)
+# debug token admin
 tok = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
-print(f"[admin-token] len={len(tok)} head={tok[:4]} tail={tok[-4:]}")  # juste pour debug
-
+print(f"[admin-token] len={len(tok)} head={tok[:4]} tail={tok[-4:]}")
 
 # ---------- CORS ----------
-
 FRONT_ORIGIN = (os.getenv("FRONT_ORIGIN", "https://ayii.netlify.app") or "").strip().rstrip("/")
-
-
-# Autoriser prod nette + previews Netlify + localhost
 NETLIFY_REGEX = r"^https://[a-z0-9-]+(\-\-[a-z0-9-]+)?\.netlify\.app$"
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        FRONT_ORIGIN,                # ex: https://ayii.netlify.app
-        "https://ayii.netlify.app",  # garde-fou au cas où FRONT_ORIGIN est mal saisi
-        "http://localhost:3000",     # dev local
+        FRONT_ORIGIN,
+        "https://ayii.netlify.app",
+        "http://localhost:3000",
     ],
-    allow_origin_regex=NETLIFY_REGEX,  # couvre deploy-preview-123--... etc.
-    allow_credentials=True,            # autorisé car on n'utilise pas "*"
-    allow_methods=["GET", "POST", "OPTIONS"],  # explicite
+    allow_origin_regex=NETLIFY_REGEX,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=86400,
 )
-
 
 # ---------- Health ----------
 @app.get("/health")
@@ -92,12 +83,14 @@ async def health():
     return {"ok": True}
 
 # ---------- Routes ----------
-from app.routes.report import router as report_router
 from app.routes.map import router as map_router
 from app.routes.dev import router as dev_router
-from app.routes.admin import router as admin_router
 
-# optionnels si présents
+# Optionnels si présents ET s'ils n'entrent pas en collision avec /report ou /admin/*
+# from app.routes.report import router as report_router
+# from app.routes.admin import router as admin_router
+
+# Optionnels si présents
 try:
     from app.routes.reverse import router as reverse_router
     app.include_router(reverse_router)
@@ -110,11 +103,14 @@ try:
 except Exception:
     pass
 
-app.include_router(report_router)
+# Router principal (contient /map, /report, /reset_user, /admin/*)
 app.include_router(map_router)
-app.include_router(admin_router)
 
-# 👉 n’activer /dev/* qu’en dev
+# Éviter les collisions :
+# app.include_router(report_router, prefix="/legacy")
+# app.include_router(admin_router,  prefix="/legacy")
+
+# n’activer /dev/* qu’en dev
 if os.getenv("ENV", "dev") == "dev":
     app.include_router(dev_router)
 
@@ -124,7 +120,8 @@ if os.getenv("ENV", "dev") == "dev":
     async def list_routes():
         return sorted([r.path for r in app.routes])
 
-import hashlib, pathlib, os
+# versioning fichiers pour debug
+import hashlib, pathlib
 
 def _sha(path):
     p = pathlib.Path(path)
@@ -134,10 +131,11 @@ def _sha(path):
 
 @app.get("/__version")
 async def version():
+    import os as _os
     return {
-        "ENV": os.getenv("ENV"),
-        "SCHEDULER_ENABLED": os.getenv("SCHEDULER_ENABLED"),
-        "AGG_INTERVAL_MIN": os.getenv("AGG_INTERVAL_MIN"),
+        "ENV": _os.getenv("ENV"),
+        "SCHEDULER_ENABLED": _os.getenv("SCHEDULER_ENABLED"),
+        "AGG_INTERVAL_MIN": _os.getenv("AGG_INTERVAL_MIN"),
         "files": {
             "aggregation.py": _sha("app/services/aggregation.py"),
             "crud.py": _sha("app/crud.py"),
@@ -146,12 +144,12 @@ async def version():
         }
     }
 
+# no-store pour /map
 from fastapi import Response, Request
 
 @app.middleware("http")
 async def no_store_cache(request: Request, call_next):
     response: Response = await call_next(request)
-    # seulement pour /map
     if request.url.path == "/map":
         response.headers["Cache-Control"] = "no-store"
     return response
