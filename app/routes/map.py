@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+from typing import Optional
 from app.db import get_db
 import os
 
@@ -23,33 +24,26 @@ def _check_admin_token(request: Request):
 # --------- Helpers lecture ----------
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
     q_full = text("""
-        WITH me AS (
-          SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
-        )
-        SELECT
-          id,
-          kind::text AS kind,
-          CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-          ST_Y(center::geometry) AS lat,
-          ST_X(center::geometry) AS lng,
-          started_at,
-          restored_at
+        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+        SELECT id,
+               kind::text AS kind,
+               CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+               ST_Y(center::geometry) AS lat,
+               ST_X(center::geometry) AS lng,
+               started_at, restored_at
         FROM outages
         WHERE ST_DWithin(center, (SELECT g FROM me), :r)
         ORDER BY started_at DESC
     """)
     q_min = text("""
-        WITH me AS (
-          SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
-        )
-        SELECT
-          id,
-          kind::text AS kind,
-          'active' AS status,
-          ST_Y(center::geometry) AS lat,
-          ST_X(center::geometry) AS lng,
-          NULL::timestamp AS started_at,
-          NULL::timestamp AS restored_at
+        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+        SELECT id,
+               kind::text AS kind,
+               'active' AS status,
+               ST_Y(center::geometry) AS lat,
+               ST_X(center::geometry) AS lng,
+               NULL::timestamp AS started_at,
+               NULL::timestamp AS restored_at
         FROM outages
         WHERE ST_DWithin(center, (SELECT g FROM me), :r)
         ORDER BY id DESC
@@ -66,46 +60,35 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
     rows = res.fetchall()
     return [
         {
-            "id": r.id,
-            "kind": r.kind,
-            "status": r.status,
-            "lat": float(r.lat),
-            "lng": float(r.lng),
+            "id": r.id, "kind": r.kind, "status": r.status,
+            "lat": float(r.lat), "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
-        }
-        for r in rows
+        } for r in rows
     ]
 
 async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
     q_full = text("""
-        WITH me AS (
-          SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
-        )
-        SELECT
-          id,
-          kind::text AS kind,
-          CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-          ST_Y(center::geometry) AS lat,
-          ST_X(center::geometry) AS lng,
-          started_at,
-          restored_at
+        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+        SELECT id,
+               kind::text AS kind,
+               CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+               ST_Y(center::geometry) AS lat,
+               ST_X(center::geometry) AS lng,
+               started_at, restored_at
         FROM incidents
         WHERE ST_DWithin(center, (SELECT g FROM me), :r)
         ORDER BY started_at DESC
     """)
     q_min = text("""
-        WITH me AS (
-          SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
-        )
-        SELECT
-          id,
-          kind::text AS kind,
-          'active' AS status,
-          ST_Y(center::geometry) AS lat,
-          ST_X(center::geometry) AS lng,
-          NULL::timestamp AS started_at,
-          NULL::timestamp AS restored_at
+        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+        SELECT id,
+               kind::text AS kind,
+               'active' AS status,
+               ST_Y(center::geometry) AS lat,
+               ST_X(center::geometry) AS lng,
+               NULL::timestamp AS started_at,
+               NULL::timestamp AS restored_at
         FROM incidents
         WHERE ST_DWithin(center, (SELECT g FROM me), :r)
         ORDER BY id DESC
@@ -122,15 +105,11 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
     rows = res.fetchall()
     return [
         {
-            "id": r.id,
-            "kind": r.kind,
-            "status": r.status,
-            "lat": float(r.lat),
-            "lng": float(r.lng),
+            "id": r.id, "kind": r.kind, "status": r.status,
+            "lat": float(r.lat), "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
-        }
-        for r in rows
+        } for r in rows
     ]
 
 # --------- GET /map ----------
@@ -153,7 +132,7 @@ async def map_endpoint(
         outages = await fetch_outages(db, lat, lng, r_m)
         incidents = await fetch_incidents(db, lat, lng, r_m)
 
-        # Reports : exclure "restored"
+        # Reports : n'afficher QUE les 'cut' (fini les valeurs legacy down / cut[espace] / etc.)
         q_rep = text(f"""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -168,7 +147,7 @@ async def map_endpoint(
               created_at
             FROM reports
             WHERE ST_DWithin(geom::geography, (SELECT g FROM me), :r)
-              AND LOWER(signal::text) <> 'restored'
+              AND LOWER(TRIM(signal::text)) = 'cut'
               AND created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
             ORDER BY created_at DESC
             LIMIT :max
@@ -177,15 +156,10 @@ async def map_endpoint(
 
         last_reports = [
             {
-                "id": r.id,
-                "kind": r.kind,
-                "signal": r.signal,
-                "lat": float(r.lat),
-                "lng": float(r.lng),
-                "user_id": r.user_id,
-                "created_at": r.created_at,
-            }
-            for r in res_rep.fetchall()
+                "id": r.id, "kind": r.kind, "signal": r.signal,
+                "lat": float(r.lat), "lng": float(r.lng),
+                "user_id": r.user_id, "created_at": r.created_at,
+            } for r in res_rep.fetchall()
         ]
 
         payload = {
@@ -221,7 +195,7 @@ async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
     2) Si signal='restored', marque comme rétabli l'élément le PLUS PROCHE (par id), sinon fallback rayon large.
     """
     try:
-        sig = "restored" if str(p.signal).lower() == "restored" else "cut"
+        sig = "restored" if str(p.signal).lower().strip() == "restored" else "cut"
 
         # 1) log report
         await db.execute(
@@ -336,8 +310,26 @@ async def admin_ensure_schema(db: AsyncSession = Depends(get_db)):
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"ensure_schema failed: {e}")
 
+# --- Normalisation & ménage des reports (legacy) ---
+@router.post("/admin/normalize_reports")
+async def admin_normalize_reports(db: AsyncSession = Depends(get_db)):
+    """
+    Normalise les valeurs legacy du champ signal :
+    - 'down' / 'cut ' -> 'cut'
+    - 'up'  / 'restored ' -> 'restored'
+    Puis supprime les reports 'restored' (non affichés sur la carte).
+    """
+    try:
+        await db.execute(text("UPDATE reports SET signal='cut' WHERE LOWER(TRIM(signal::text)) IN ('down','cut')"))
+        await db.execute(text("UPDATE reports SET signal='restored' WHERE LOWER(TRIM(signal::text)) IN ('up','restored')"))
+        await db.execute(text("DELETE FROM reports WHERE LOWER(TRIM(signal::text))='restored'"))
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"normalize_reports failed: {e}")
+
 # seed & ops proximité
-from typing import Optional
 class AdminCreateIn(BaseModel):
     kind: str
     lat: float
@@ -371,7 +363,6 @@ async def admin_seed_incident(p: AdminCreateIn, db: AsyncSession = Depends(get_d
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"seed_incident failed: {e}")
 
-
 @router.post("/admin/seed_outage")
 async def admin_seed_outage(p: AdminCreateIn, db: AsyncSession = Depends(get_db)):
     try:
@@ -392,7 +383,6 @@ async def admin_seed_outage(p: AdminCreateIn, db: AsyncSession = Depends(get_db)
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"seed_outage failed: {e}")
-
 
 @router.post("/admin/restore_near")
 async def admin_restore_near(p: AdminNearIn, db: AsyncSession = Depends(get_db)):
@@ -451,7 +441,7 @@ async def admin_delete_near(p: AdminNearIn, db: AsyncSession = Depends(get_db)):
 @router.post("/admin/clear_restored_reports")
 async def admin_clear_restored_reports(db: AsyncSession = Depends(get_db)):
     try:
-        await db.execute(text("DELETE FROM reports WHERE LOWER(signal::text) = 'restored'"))
+        await db.execute(text("DELETE FROM reports WHERE LOWER(TRIM(signal::text))='restored'"))
         await db.commit()
         return {"ok": True}
     except Exception as e:
