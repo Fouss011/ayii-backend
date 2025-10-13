@@ -459,3 +459,45 @@ async def admin_delete_near(p: AdminNearIn, db: AsyncSession = Depends(get_db)):
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"delete_near failed: {e}")
+
+# --- AJOUTER EN BAS DE app/routes/map.py ---
+from fastapi import Request
+
+ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
+
+def _check_admin_token(request: Request):
+    # Si un token est défini côté serveur, on le demande via header
+    if ADMIN_TOKEN:
+        tok = request.headers.get("x-admin-token", "")
+        if tok != ADMIN_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid admin token")
+
+@router.post("/admin/wipe_all")
+async def admin_wipe_all(
+    request: Request,
+    truncate: bool = Query(False, description="Si true: TRUNCATE + RESTART IDENTITY"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Efface TOUT: reports + incidents + outages.
+    - truncate=false => DELETE FROM (préserve séquences)
+    - truncate=true  => TRUNCATE ... RESTART IDENTITY (remet les IDs à 1)
+    Protégé par x-admin-token si ADMIN_TOKEN est présent.
+    """
+    _check_admin_token(request)
+    try:
+        if truncate:
+            # reset total (IDs repris à 1)
+            await db.execute(text("TRUNCATE TABLE reports RESTART IDENTITY CASCADE"))
+            await db.execute(text("TRUNCATE TABLE incidents RESTART IDENTITY CASCADE"))
+            await db.execute(text("TRUNCATE TABLE outages RESTART IDENTITY CASCADE"))
+        else:
+            # supprime tout sans toucher aux séquences
+            await db.execute(text("DELETE FROM reports"))
+            await db.execute(text("DELETE FROM incidents"))
+            await db.execute(text("DELETE FROM outages"))
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"wipe_all failed: {e}")
