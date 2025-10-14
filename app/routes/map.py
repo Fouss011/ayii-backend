@@ -133,7 +133,7 @@ async def map_endpoint(
         outages = await fetch_outages(db, lat, lng, r_m)
         incidents = await fetch_incidents(db, lat, lng, r_m)
 
-        # Reports : n'afficher QUE les 'cut' (fini les valeurs legacy down / cut[espace] / etc.)
+        # Reports : n'afficher QUE les 'cut'
         q_rep = text(f"""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -154,7 +154,6 @@ async def map_endpoint(
             LIMIT :max
         """)
         res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
-
         last_reports = [
             {
                 "id": r.id, "kind": r.kind, "signal": r.signal,
@@ -162,6 +161,15 @@ async def map_endpoint(
                 "user_id": r.user_id, "created_at": r.created_at,
             } for r in res_rep.fetchall()
         ]
+
+        # ====== EXCLURE IMMÉDIATEMENT LES 'restored' (incidents + outages) ======
+        def _is_active(obj: dict) -> bool:
+            s = (obj.get("status") or "").lower()
+            return s != "restored"
+
+        outages   = [o for o in outages   if _is_active(o)]
+        incidents = [i for i in incidents if _is_active(i)]
+        # =======================================================================
 
         payload = {
             "outages": outages,
@@ -285,7 +293,7 @@ async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
     except Exception as e:
         try:
             await db.rollback()
-        except:
+        except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"report failed: {e}")
 
@@ -361,16 +369,16 @@ async def admin_normalize_reports(db: AsyncSession = Depends(get_db)):
 
 # seed & ops proximité
 class AdminCreateIn(BaseModel):
-    kind: str
-    lat: float
-    lng: float
-    started_at: Optional[str] = None
+  kind: str
+  lat: float
+  lng: float
+  started_at: Optional[str] = None
 
 class AdminNearIn(BaseModel):
-    kind: str
-    lat: float
-    lng: float
-    radius_m: int = RESTORE_RADIUS_M
+  kind: str
+  lat: float
+  lng: float
+  radius_m: int = RESTORE_RADIUS_M
 
 @router.post("/admin/seed_incident")
 async def admin_seed_incident(p: AdminCreateIn, db: AsyncSession = Depends(get_db)):
