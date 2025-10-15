@@ -1,11 +1,11 @@
 # app/routes/map.py
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request, Header
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from typing import Optional
 from app.db import get_db
-import os
+import os, uuid
 
 router = APIRouter()
 
@@ -21,6 +21,15 @@ def _check_admin_token(request: Request):
         tok = request.headers.get("x-admin-token", "")
         if tok != ADMIN_TOKEN:
             raise HTTPException(status_code=401, detail="Invalid admin token")
+
+def _to_uuid_or_none(v) -> Optional[str]:
+    """Retourne une string UUID v4 (canonique) ou None si invalide/absent."""
+    if not v:
+        return None
+    try:
+        return str(uuid.UUID(str(v)))
+    except Exception:
+        return None
 
 # --------- Helpers lecture ----------
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
@@ -133,7 +142,7 @@ async def map_endpoint(
         outages = await fetch_outages(db, lat, lng, r_m)
         incidents = await fetch_incidents(db, lat, lng, r_m)
 
-        # Reports : n'afficher QUE les 'cut'
+        # Reports : n'afficher QUE les 'cut' récents
         q_rep = text(f"""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
@@ -154,6 +163,7 @@ async def map_endpoint(
             LIMIT :max
         """)
         res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
+
         last_reports = [
             {
                 "id": r.id, "kind": r.kind, "signal": r.signal,
@@ -161,15 +171,6 @@ async def map_endpoint(
                 "user_id": r.user_id, "created_at": r.created_at,
             } for r in res_rep.fetchall()
         ]
-
-        # ====== EXCLURE IMMÉDIATEMENT LES 'restored' (incidents + outages) ======
-        def _is_active(obj: dict) -> bool:
-            s = (obj.get("status") or "").lower()
-            return s != "restored"
-
-        outages   = [o for o in outages   if _is_active(o)]
-        incidents = [i for i in incidents if _is_active(i)]
-        # =======================================================================
 
         payload = {
             "outages": outages,
@@ -198,15 +199,23 @@ class ReportIn(BaseModel):
     user_id: str | None = None
 
 @router.post("/report")
-async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
+async def post_report(
+    p: ReportIn,
+    db: AsyncSession = Depends(get_db),
+    x_admin_token: Optional[str] = Header(default=None)
+):
     """
-    1) Insère le report.
+    1) Insère le report (user_id auto-normalisé en UUID ou NULL).
     2) Si signal='restored':
        - marque comme rétabli l'élément le PLUS PROCHE (incidents/outages),
-       - supprime les reports 'cut' proches du clic (même kind), d'abord pour le même user_id, sinon tous.
+       - supprime les reports 'cut' proches (même kind), d'abord pour le même user_id sinon tous.
     """
     try:
         sig = "restored" if str(p.signal).lower().strip() == "restored" else "cut"
+        uid = _to_uuid_or_none(p.user_id)
+
+        # (optionnel) mode admin : à garder pour extensions (quota, etc.)
+        is_admin = (x_admin_token or "").strip() == ADMIN_TOKEN
 
         # 1) Journaliser le report
         await db.execute(
@@ -216,7 +225,7 @@ async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
                         ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
                         :user_id, NOW())
             """),
-            {"kind": p.kind, "signal": sig, "lat": p.lat, "lng": p.lng, "user_id": p.user_id}
+            {"kind": p.kind, "signal": sig, "lat": p.lat, "lng": p.lng, "user_id": uid}
         )
 
         if sig == "restored":
@@ -255,7 +264,7 @@ async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
                 )
 
             # 2b) SUPPRIMER les reports 'cut' proches (même kind)
-            #    - priorité: même user_id (en gérant les NULL via IS NOT DISTINCT FROM)
+            # priorité: même user_id (en gérant les NULL via IS NOT DISTINCT FROM)
             del_same_user = await db.execute(
                 text("""
                     WITH me AS (
@@ -268,7 +277,7 @@ async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
                       AND (r.user_id IS NOT DISTINCT FROM :uid)
                     RETURNING id
                 """),
-                {"lng": p.lng, "lat": p.lat, "kind": p.kind, "dr": CLEANUP_RADIUS_M, "uid": p.user_id}
+                {"lng": p.lng, "lat": p.lat, "kind": p.kind, "dr": CLEANUP_RADIUS_M, "uid": uid}
             )
             deleted_rows = del_same_user.fetchall()
 
@@ -293,7 +302,7 @@ async def post_report(p: ReportIn, db: AsyncSession = Depends(get_db)):
     except Exception as e:
         try:
             await db.rollback()
-        except Exception:
+        except:
             pass
         raise HTTPException(status_code=500, detail=f"report failed: {e}")
 
@@ -369,16 +378,16 @@ async def admin_normalize_reports(db: AsyncSession = Depends(get_db)):
 
 # seed & ops proximité
 class AdminCreateIn(BaseModel):
-  kind: str
-  lat: float
-  lng: float
-  started_at: Optional[str] = None
+    kind: str
+    lat: float
+    lng: float
+    started_at: Optional[str] = None
 
 class AdminNearIn(BaseModel):
-  kind: str
-  lat: float
-  lng: float
-  radius_m: int = RESTORE_RADIUS_M
+    kind: str
+    lat: float
+    lng: float
+    radius_m: int = RESTORE_RADIUS_M
 
 @router.post("/admin/seed_incident")
 async def admin_seed_incident(p: AdminCreateIn, db: AsyncSession = Depends(get_db)):
