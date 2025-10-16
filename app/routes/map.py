@@ -10,11 +10,15 @@ import os, uuid
 router = APIRouter()
 
 # --------- Config ----------
-POINTS_WINDOW_MIN = int(os.getenv("POINTS_WINDOW_MIN", "240"))
-MAX_REPORTS       = int(os.getenv("MAX_REPORTS", "500"))
-RESTORE_RADIUS_M  = int(os.getenv("RESTORE_RADIUS_M", "200"))  # fallback large si besoin
-CLEANUP_RADIUS_M  = int(os.getenv("CLEANUP_RADIUS_M", "80"))   # rayon pour supprimer les reports 'cut' proches
-ADMIN_TOKEN       = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
+POINTS_WINDOW_MIN   = int(os.getenv("POINTS_WINDOW_MIN", "240"))
+MAX_REPORTS         = int(os.getenv("MAX_REPORTS", "500"))
+RESTORE_RADIUS_M    = int(os.getenv("RESTORE_RADIUS_M", "200"))
+CLEANUP_RADIUS_M    = int(os.getenv("CLEANUP_RADIUS_M", "80"))
+ADMIN_TOKEN         = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
+
+# Ownership: seul l’auteur du CUT proche (et récent) peut RESTORE
+OWNERSHIP_RADIUS_M  = int(os.getenv("OWNERSHIP_RADIUS_M", "150"))     # rayon d’association
+OWNERSHIP_WINDOW_MIN= int(os.getenv("OWNERSHIP_WINDOW_MIN", "1440"))  # 24h
 
 def _check_admin_token(request: Request):
     if ADMIN_TOKEN:
@@ -23,7 +27,6 @@ def _check_admin_token(request: Request):
             raise HTTPException(status_code=401, detail="Invalid admin token")
 
 def _to_uuid_or_none(v) -> Optional[str]:
-    """Retourne une string UUID v4 (canonique) ou None si invalide/absent."""
     if not v:
         return None
     try:
@@ -35,11 +38,9 @@ def _to_uuid_or_none(v) -> Optional[str]:
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
     q_full = text("""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-        SELECT id,
-               kind::text AS kind,
+        SELECT id, kind::text AS kind,
                CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-               ST_Y(center::geometry) AS lat,
-               ST_X(center::geometry) AS lng,
+               ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
                started_at, restored_at
         FROM outages
         WHERE ST_DWithin(center, (SELECT g FROM me), :r)
@@ -47,13 +48,9 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
     """)
     q_min = text("""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-        SELECT id,
-               kind::text AS kind,
-               'active' AS status,
-               ST_Y(center::geometry) AS lat,
-               ST_X(center::geometry) AS lng,
-               NULL::timestamp AS started_at,
-               NULL::timestamp AS restored_at
+        SELECT id, kind::text AS kind, 'active' AS status,
+               ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
+               NULL::timestamp AS started_at, NULL::timestamp AS restored_at
         FROM outages
         WHERE ST_DWithin(center, (SELECT g FROM me), :r)
         ORDER BY id DESC
@@ -80,11 +77,9 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
 async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
     q_full = text("""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-        SELECT id,
-               kind::text AS kind,
+        SELECT id, kind::text AS kind,
                CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-               ST_Y(center::geometry) AS lat,
-               ST_X(center::geometry) AS lng,
+               ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
                started_at, restored_at
         FROM incidents
         WHERE ST_DWithin(center, (SELECT g FROM me), :r)
@@ -92,13 +87,9 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
     """)
     q_min = text("""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-        SELECT id,
-               kind::text AS kind,
-               'active' AS status,
-               ST_Y(center::geometry) AS lat,
-               ST_X(center::geometry) AS lng,
-               NULL::timestamp AS started_at,
-               NULL::timestamp AS restored_at
+        SELECT id, kind::text AS kind, 'active' AS status,
+               ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
+               NULL::timestamp AS started_at, NULL::timestamp AS restored_at
         FROM incidents
         WHERE ST_DWithin(center, (SELECT g FROM me), :r)
         ORDER BY id DESC
@@ -138,23 +129,15 @@ async def map_endpoint(
             pass
 
         r_m = float(radius_km * 1000.0)
-
-        outages = await fetch_outages(db, lat, lng, r_m)
+        outages   = await fetch_outages(db, lat, lng, r_m)
         incidents = await fetch_incidents(db, lat, lng, r_m)
 
-        # Reports : n'afficher QUE les 'cut' récents
+        # Derniers reports: SEULEMENT 'cut' récents
         q_rep = text(f"""
-            WITH me AS (
-              SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g
-            )
-            SELECT
-              id,
-              kind::text AS kind,
-              signal::text AS signal,
-              ST_Y(geom::geometry) AS lat,
-              ST_X(geom::geometry) AS lng,
-              user_id,
-              created_at
+            WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g)
+            SELECT id, kind::text AS kind, signal::text AS signal,
+                   ST_Y(geom::geometry) AS lat, ST_X(geom::geometry) AS lng,
+                   user_id, created_at
             FROM reports
             WHERE ST_DWithin(geom::geography, (SELECT g FROM me), :r)
               AND LOWER(TRIM(signal::text)) = 'cut'
@@ -205,17 +188,33 @@ async def post_report(
     x_admin_token: Optional[str] = Header(default=None)
 ):
     """
-    1) Insère le report (user_id auto-normalisé en UUID ou NULL).
+    1) Insère le report (user_id -> UUID canonique ou NULL).
     2) Si signal='restored':
-       - marque comme rétabli l'élément le PLUS PROCHE (incidents/outages),
-       - supprime les reports 'cut' proches (même kind), d'abord pour le même user_id sinon tous.
+       - Autoriser seulement l’auteur du 'cut' récent et proche (sauf admin),
+       - Marquer rétabli l’élément le + proche (incidents/outages),
+       - Nettoyer les 'cut' proches.
     """
     try:
         sig = "restored" if str(p.signal).lower().strip() == "restored" else "cut"
         uid = _to_uuid_or_none(p.user_id)
-
-        # (optionnel) mode admin : à garder pour extensions (quota, etc.)
         is_admin = (x_admin_token or "").strip() == ADMIN_TOKEN
+
+        # ---- Ownership rule pour RESTORE (hors admin) ----
+        if sig == "restored" and not is_admin:
+            if not uid:
+                raise HTTPException(status_code=403, detail="not_owner: missing user_id")
+            check = await db.execute(text(f"""
+                WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+                SELECT 1 FROM reports r
+                WHERE r.kind = :kind
+                  AND LOWER(TRIM(r.signal::text)) = 'cut'
+                  AND r.user_id IS NOT DISTINCT FROM :uid
+                  AND ST_DWithin(r.geom::geography, (SELECT g FROM me), :dr)
+                  AND r.created_at > NOW() - INTERVAL '{OWNERSHIP_WINDOW_MIN} minutes'
+                LIMIT 1
+            """), {"kind": p.kind, "lng": p.lng, "lat": p.lat, "uid": uid, "dr": OWNERSHIP_RADIUS_M})
+            if check.first() is None:
+                raise HTTPException(status_code=403, detail="not_owner")
 
         # 1) Journaliser le report
         await db.execute(
@@ -229,76 +228,58 @@ async def post_report(
         )
 
         if sig == "restored":
-            # 2a) Restaurer l’élément le plus proche (par id)
-            target_table = "outages" if p.kind in ("power", "water") else "incidents"
-            await db.execute(text(f"ALTER TABLE {target_table} ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
-
+            # 2a) Restaurer l’élément le plus proche
+            target = "outages" if p.kind in ("power", "water") else "incidents"
+            await db.execute(text(f"ALTER TABLE {target} ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
             res_nearest = await db.execute(
                 text(f"""
-                    WITH me AS (
-                      SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-                    )
-                    SELECT id
-                    FROM {target_table}
-                    WHERE kind = :kind
-                      AND (restored_at IS NULL OR restored_at > NOW() - INTERVAL '100 years')
+                    WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+                    SELECT id FROM {target}
+                    WHERE kind = :kind AND (restored_at IS NULL OR restored_at > NOW() - INTERVAL '100 years')
                     ORDER BY center <-> (SELECT g FROM me)
                     LIMIT 1
-                """),
-                {"lng": p.lng, "lat": p.lat, "kind": p.kind}
+                """), {"lng": p.lng, "lat": p.lat, "kind": p.kind}
             )
             row = res_nearest.first()
             if row and row[0] is not None:
-                await db.execute(text(f"UPDATE {target_table} SET restored_at = NOW() WHERE id = :id"), {"id": row[0]})
+                await db.execute(text(f"UPDATE {target} SET restored_at = NOW() WHERE id = :id"), {"id": row[0]})
             else:
-                # fallback: rayon large si aucun nearest trouvé
                 await db.execute(
                     text(f"""
                         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-                        UPDATE {target_table}
-                           SET restored_at = NOW()
-                         WHERE kind = :kind
-                           AND ST_DWithin(center, (SELECT g FROM me), :r)
-                    """),
-                    {"lng": p.lng, "lat": p.lat, "kind": p.kind, "r": max(RESTORE_RADIUS_M, 1000)}
+                        UPDATE {target} SET restored_at = NOW()
+                        WHERE kind = :kind AND ST_DWithin(center, (SELECT g FROM me), :r)
+                    """), {"lng": p.lng, "lat": p.lat, "kind": p.kind, "r": max(RESTORE_RADIUS_M, 1000)}
                 )
 
-            # 2b) SUPPRIMER les reports 'cut' proches (même kind)
-            # priorité: même user_id (en gérant les NULL via IS NOT DISTINCT FROM)
+            # 2b) Nettoyer les 'cut' proches (même user d’abord)
             del_same_user = await db.execute(
                 text("""
-                    WITH me AS (
-                      SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-                    )
+                    WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                     DELETE FROM reports r
                     WHERE LOWER(TRIM(r.signal::text))='cut'
                       AND r.kind = :kind
                       AND ST_DWithin(r.geom::geography, (SELECT g FROM me), :dr)
                       AND (r.user_id IS NOT DISTINCT FROM :uid)
                     RETURNING id
-                """),
-                {"lng": p.lng, "lat": p.lat, "kind": p.kind, "dr": CLEANUP_RADIUS_M, "uid": uid}
+                """), {"lng": p.lng, "lat": p.lat, "kind": p.kind, "dr": CLEANUP_RADIUS_M, "uid": uid}
             )
-            deleted_rows = del_same_user.fetchall()
-
-            if len(deleted_rows) == 0:
-                # si rien pour ce user, supprime quand même les 'cut' proches (quel que soit l'user)
+            if len(del_same_user.fetchall()) == 0:
                 await db.execute(
                     text("""
-                        WITH me AS (
-                          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-                        )
+                        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                         DELETE FROM reports r
                         WHERE LOWER(TRIM(r.signal::text))='cut'
                           AND r.kind = :kind
                           AND ST_DWithin(r.geom::geography, (SELECT g FROM me), :dr)
-                    """),
-                    {"lng": p.lng, "lat": p.lat, "kind": p.kind, "dr": CLEANUP_RADIUS_M}
+                    """), {"lng": p.lng, "lat": p.lat, "kind": p.kind, "dr": CLEANUP_RADIUS_M}
                 )
 
         await db.commit()
         return {"ok": True}
 
+    except HTTPException:
+        raise
     except Exception as e:
         try:
             await db.rollback()
@@ -309,10 +290,6 @@ async def post_report(
 # --------- POST /reset_user ----------
 @router.post("/reset_user")
 async def reset_user(id: str = Query(..., alias="id"), db: AsyncSession = Depends(get_db)):
-    """
-    Supprime tous les reports de cet utilisateur (UUID ou TEXT).
-    Double tentative si la colonne est de type uuid.
-    """
     try:
         try:
             await db.execute(text("DELETE FROM reports WHERE user_id = :id"), {"id": id})
@@ -324,7 +301,7 @@ async def reset_user(id: str = Query(..., alias="id"), db: AsyncSession = Depend
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"reset_user failed: {e}")
 
-# --------- ADMIN: maintenance ----------
+# --------- ADMIN maintenance ----------
 @router.post("/admin/wipe_all")
 async def admin_wipe_all(request: Request, truncate: bool = Query(False), db: AsyncSession = Depends(get_db)):
     _check_admin_token(request)
@@ -360,12 +337,6 @@ async def admin_ensure_schema(db: AsyncSession = Depends(get_db)):
 
 @router.post("/admin/normalize_reports")
 async def admin_normalize_reports(db: AsyncSession = Depends(get_db)):
-    """
-    Normalise les valeurs legacy du champ signal :
-    - 'down' / 'cut ' -> 'cut'
-    - 'up'  / 'restored ' -> 'restored'
-    Puis supprime les reports 'restored' (non affichés sur la carte).
-    """
     try:
         await db.execute(text("UPDATE reports SET signal='cut' WHERE LOWER(TRIM(signal::text)) IN ('down','cut')"))
         await db.execute(text("UPDATE reports SET signal='restored' WHERE LOWER(TRIM(signal::text)) IN ('up','restored')"))
@@ -376,7 +347,6 @@ async def admin_normalize_reports(db: AsyncSession = Depends(get_db)):
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"normalize_reports failed: {e}")
 
-# seed & ops proximité
 class AdminCreateIn(BaseModel):
     kind: str
     lat: float
@@ -395,12 +365,8 @@ async def admin_seed_incident(p: AdminCreateIn, db: AsyncSession = Depends(get_d
         await db.execute(
             text("""
                 INSERT INTO incidents(kind, center, started_at, restored_at)
-                VALUES (
-                  :kind,
-                  ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                  COALESCE(CAST(:started_at AS timestamp), NOW()),
-                  NULL
-                )
+                VALUES (:kind, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                        COALESCE(CAST(:started_at AS timestamp), NOW()), NULL)
             """),
             {"kind": p.kind, "lat": p.lat, "lng": p.lng, "started_at": p.started_at}
         )
@@ -416,12 +382,8 @@ async def admin_seed_outage(p: AdminCreateIn, db: AsyncSession = Depends(get_db)
         await db.execute(
             text("""
                 INSERT INTO outages(kind, center, started_at, restored_at)
-                VALUES (
-                  :kind,
-                  ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                  COALESCE(CAST(:started_at AS timestamp), NOW()),
-                  NULL
-                )
+                VALUES (:kind, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                        COALESCE(CAST(:started_at AS timestamp), NOW()), NULL)
             """),
             {"kind": p.kind, "lat": p.lat, "lng": p.lng, "started_at": p.started_at}
         )
@@ -440,8 +402,7 @@ async def admin_restore_near(p: AdminNearIn, db: AsyncSession = Depends(get_db))
                 WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                 UPDATE {table} SET restored_at = NOW()
                 WHERE kind = :kind AND ST_DWithin(center, (SELECT g FROM me), :r)
-            """),
-            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
+            """), {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
         )
         await db.commit()
         return {"ok": True}
@@ -458,8 +419,7 @@ async def admin_unrestore_near(p: AdminNearIn, db: AsyncSession = Depends(get_db
                 WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                 UPDATE {table} SET restored_at = NULL
                 WHERE kind = :kind AND ST_DWithin(center, (SELECT g FROM me), :r)
-            """),
-            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
+            """), {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
         )
         await db.commit()
         return {"ok": True}
@@ -476,8 +436,7 @@ async def admin_delete_near(p: AdminNearIn, db: AsyncSession = Depends(get_db)):
                 WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                 DELETE FROM {table}
                 WHERE kind = :kind AND ST_DWithin(center, (SELECT g FROM me), :r)
-            """),
-            {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
+            """), {"kind": p.kind, "lat": p.lat, "lng": p.lng, "r": p.radius_m}
         )
         await db.commit()
         return {"ok": True}
