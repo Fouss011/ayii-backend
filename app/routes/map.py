@@ -26,11 +26,11 @@ def _check_admin_token(request: Request):
         if tok != ADMIN_TOKEN:
             raise HTTPException(status_code=401, detail="Invalid admin token")
 
-def _to_uuid_or_none(v) -> Optional[str]:
-    if not v:
-        return None
+def _to_uuid_or_none(val: Optional[str]):
     try:
-        return str(uuid.UUID(str(v)))
+        if not val:
+            return None
+        return str(uuid.UUID(str(val)))
     except Exception:
         return None
 
@@ -173,13 +173,13 @@ async def map_endpoint(
             pass
         raise HTTPException(status_code=500, detail=str(e))
 
-# --------- POST /report ----------
 class ReportIn(BaseModel):
     kind: str            # "power" | "water" | "traffic" | "accident" | "fire" | "flood"
     signal: str          # "cut" | "restored"
     lat: float
     lng: float
-    user_id: str | None = None
+    user_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 @router.post("/report")
 async def post_report(
@@ -187,105 +187,116 @@ async def post_report(
     db: AsyncSession = Depends(get_db),
     x_admin_token: Optional[str] = Header(default=None)
 ):
-    """
-    1) Insère le report (user_id -> UUID canonique ou NULL).
-    2) Si signal='restored':
-       - Autoriser seulement l’auteur du 'cut' récent et proche (sauf admin),
-       - Marquer rétabli l’élément le + proche (incidents/outages),
-       - Nettoyer les 'cut' proches.
-    """
+    kind = (p.kind or "").lower().strip()
+    signal = (p.signal or "").lower().strip()
+    if kind not in {"power","water","traffic","accident","fire","flood"}:
+        raise HTTPException(400, "invalid kind")
+    if signal not in {"cut","restored"}:
+        raise HTTPException(400, "invalid signal")
+
+    uid = _to_uuid_or_none(p.user_id)
+    is_admin = (x_admin_token or "").strip() == ADMIN_TOKEN
+
+    # Upsert user pour éviter FK cassée
+    if uid:
+        try:
+            await db.execute(
+                text("INSERT INTO app_users(id) VALUES(CAST(:uid AS uuid)) ON CONFLICT (id) DO NOTHING"),
+                {"uid": uid}
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+
+    # Idempotence côté serveur
+    await db.execute(text(
+        "ALTER TABLE reports ADD COLUMN IF NOT EXISTS idempotency_key text"
+    ))
+    await db.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_reports_idem ON reports (idempotency_key) WHERE idempotency_key IS NOT NULL"
+    ))
+    await db.commit()
+
+    # 1) Enregistrer le report (avec géo). Retry anonymisé si FK user casse.
     try:
-        sig = "restored" if str(p.signal).lower().strip() == "restored" else "cut"
-        uid = _to_uuid_or_none(p.user_id)
-        is_admin = (x_admin_token or "").strip() == ADMIN_TOKEN
-
-        # ---- Ownership rule pour RESTORE (hors admin) ----
-        if sig == "restored" and not is_admin:
-            if not uid:
-                raise HTTPException(status_code=403, detail="not_owner: missing user_id")
-            check = await db.execute(text(f"""
-                WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-                SELECT 1 FROM reports r
-                WHERE r.kind = :kind
-                  AND LOWER(TRIM(r.signal::text)) = 'cut'
-                  AND r.user_id IS NOT DISTINCT FROM :uid
-                  AND ST_DWithin(r.geom::geography, (SELECT g FROM me), :dr)
-                  AND r.created_at > NOW() - INTERVAL '{OWNERSHIP_WINDOW_MIN} minutes'
-                LIMIT 1
-            """), {"kind": p.kind, "lng": p.lng, "lat": p.lat, "uid": uid, "dr": OWNERSHIP_RADIUS_M})
-            if check.first() is None:
-                raise HTTPException(status_code=403, detail="not_owner")
-
-        # 1) Journaliser le report
-        await db.execute(
-            text("""
-                INSERT INTO reports(kind, signal, geom, user_id, created_at)
+        await db.execute(text("""
+            INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
+            VALUES (:kind, :signal,
+                    ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                    CAST(:uid AS uuid), NOW(), :idem)
+            ON CONFLICT (idempotency_key) DO NOTHING
+        """), {
+            "kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat,
+            "uid": uid, "idem": p.idempotency_key
+        })
+        await db.commit()
+    except Exception as e:
+        msg = str(e).lower()
+        if ("foreignkey" in msg or "user_id" in msg) and uid:
+            await db.rollback()
+            await db.execute(text("""
+                INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
                 VALUES (:kind, :signal,
                         ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                        :user_id, NOW())
-            """),
-            {"kind": p.kind, "signal": sig, "lat": p.lat, "lng": p.lng, "user_id": uid}
-        )
-
-        if sig == "restored":
-            # 2a) Restaurer l’élément le plus proche
-            target = "outages" if p.kind in ("power", "water") else "incidents"
-            await db.execute(text(f"ALTER TABLE {target} ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
-            res_nearest = await db.execute(
-                text(f"""
-                    WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-                    SELECT id FROM {target}
-                    WHERE kind = :kind AND (restored_at IS NULL OR restored_at > NOW() - INTERVAL '100 years')
-                    ORDER BY center <-> (SELECT g FROM me)
-                    LIMIT 1
-                """), {"lng": p.lng, "lat": p.lat, "kind": p.kind}
-            )
-            row = res_nearest.first()
-            if row and row[0] is not None:
-                await db.execute(text(f"UPDATE {target} SET restored_at = NOW() WHERE id = :id"), {"id": row[0]})
-            else:
-                await db.execute(
-                    text(f"""
-                        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-                        UPDATE {target} SET restored_at = NOW()
-                        WHERE kind = :kind AND ST_DWithin(center, (SELECT g FROM me), :r)
-                    """), {"lng": p.lng, "lat": p.lat, "kind": p.kind, "r": max(RESTORE_RADIUS_M, 1000)}
-                )
-
-            # 2b) Nettoyer les 'cut' proches (même user d’abord)
-            del_same_user = await db.execute(
-                text("""
-                    WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-                    DELETE FROM reports r
-                    WHERE LOWER(TRIM(r.signal::text))='cut'
-                      AND r.kind = :kind
-                      AND ST_DWithin(r.geom::geography, (SELECT g FROM me), :dr)
-                      AND (r.user_id IS NOT DISTINCT FROM :uid)
-                    RETURNING id
-                """), {"lng": p.lng, "lat": p.lat, "kind": p.kind, "dr": CLEANUP_RADIUS_M, "uid": uid}
-            )
-            if len(del_same_user.fetchall()) == 0:
-                await db.execute(
-                    text("""
-                        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-                        DELETE FROM reports r
-                        WHERE LOWER(TRIM(r.signal::text))='cut'
-                          AND r.kind = :kind
-                          AND ST_DWithin(r.geom::geography, (SELECT g FROM me), :dr)
-                    """), {"lng": p.lng, "lat": p.lat, "kind": p.kind, "dr": CLEANUP_RADIUS_M}
-                )
-
-        await db.commit()
-        return {"ok": True}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        try:
+                        NULL, NOW(), :idem)
+                ON CONFLICT (idempotency_key) DO NOTHING
+            """), {
+                "kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat,
+                "idem": p.idempotency_key
+            })
+            await db.commit()
+        else:
             await db.rollback()
-        except:
-            pass
-        raise HTTPException(status_code=500, detail=f"report failed: {e}")
+            raise HTTPException(500, f"report insert failed: {e}")
+
+    # 2) Maintenir INCIDENTS (vérité pour la carte)
+    if signal == "cut":
+        # Crée un incident s'il n'y en a pas déjà un actif à <=120 m
+        await db.execute(text("""
+            WITH me AS (
+              SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+            )
+            INSERT INTO incidents(kind, center, started_at, restored_at)
+            SELECT :kind, (SELECT g FROM me), NOW(), NULL
+            WHERE NOT EXISTS (
+              SELECT 1 FROM incidents i
+               WHERE i.kind = :kind
+                 AND i.restored_at IS NULL
+                 AND ST_DWithin(i.center, (SELECT g FROM me), 120)
+            )
+        """), {"kind": kind, "lng": p.lng, "lat": p.lat})
+        await db.commit()
+    else:  # RESTORED
+        # Ownership (si pas admin, on exige un CUT proche par le même user dans 24h)
+        if not is_admin and uid:
+            q = await db.execute(text("""
+                WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+                SELECT 1
+                  FROM reports r
+                 WHERE r.kind=:kind AND lower(trim(r.signal))='cut'
+                   AND r.user_id = CAST(:uid AS uuid)
+                   AND r.created_at >= NOW() - INTERVAL '24 hours'
+                   AND ST_DWithin(r.geom, (SELECT g FROM me), 150)
+                 LIMIT 1
+            """), {"kind": kind, "uid": uid, "lng": p.lng, "lat": p.lat})
+            if q.first() is None:
+                raise HTTPException(403, "not_owner")
+
+        # Ferme l'incident actif le plus proche (<=150 m)
+        await db.execute(text("""
+            WITH me AS (
+              SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+            )
+            UPDATE incidents i
+               SET restored_at = COALESCE(i.restored_at, NOW())
+             WHERE i.kind = :kind
+               AND i.restored_at IS NULL
+               AND ST_DWithin(i.center, (SELECT g FROM me), 150)
+        """), {"kind": kind, "lng": p.lng, "lat": p.lat})
+        await db.commit()
+
+    # 3) Les ZONES sont gérées par le service d’agrégation (aggregation.py)
+    return {"ok": True}
 
 # --------- POST /reset_user ----------
 @router.post("/reset_user")
