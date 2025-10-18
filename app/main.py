@@ -70,15 +70,11 @@ NETLIFY_REGEX = r"^https://[a-z0-9-]+(\-\-[a-z0-9-]+)?\.netlify\.app$"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        FRONT_ORIGIN,
-        "https://ayii.netlify.app",
-        "http://localhost:3000",
-    ],
-    allow_origin_regex=NETLIFY_REGEX,  # autorise les previews Netlify
-    allow_credentials=False,           # pas de cookies, plus simple pour CORS
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "x-admin-token"],
+    allow_origins=["*"],          # 👈 temporaire
+    allow_origin_regex=".*",      # 👈 temporaire
+    allow_credentials=False,      # pas de cookies
+    allow_methods=["*"],          # GET/POST/OPTIONS…
+    allow_headers=["*"],          # Content-Type, x-admin-token, etc.
     expose_headers=[],
     max_age=86400,
 )
