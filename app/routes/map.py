@@ -6,6 +6,8 @@ from sqlalchemy import text
 from typing import Optional
 from app.db import get_db
 import os, uuid
+import hashlib, time
+
 
 router = APIRouter()
 
@@ -179,7 +181,8 @@ class ReportIn(BaseModel):
     lat: float
     lng: float
     user_id: Optional[str] = None
-    idempotency_key: Optional[str] = None
+    idempotency_key: Optional[str] = None  # facultative (on la génère si absente)
+
 
 @router.post("/report")
 async def post_report(
@@ -197,7 +200,16 @@ async def post_report(
     uid = _to_uuid_or_none(p.user_id)
     is_admin = (x_admin_token or "").strip() == ADMIN_TOKEN
 
-    # Upsert user pour éviter FK cassée
+    # 0) Idempotence serveur (si le front n’en envoie pas)
+    #    clé = sha1(kind|signal|lat|lng|uid/anon|bucket5s)
+    if p.idempotency_key and len(p.idempotency_key) >= 8:
+        idem = p.idempotency_key
+    else:
+        bucket5s = int(time.time() // 5)
+        base = f"{kind}|{signal}|{round(p.lat,5)}|{round(p.lng,5)}|{uid or 'anon'}|{bucket5s}"
+        idem = hashlib.sha1(base.encode()).hexdigest()
+
+    # 1) Upsert user (évite FK cassée)
     if uid:
         try:
             await db.execute(
@@ -208,16 +220,14 @@ async def post_report(
         except Exception:
             await db.rollback()
 
-    # Idempotence côté serveur
-    await db.execute(text(
-        "ALTER TABLE reports ADD COLUMN IF NOT EXISTS idempotency_key text"
-    ))
+    # 2) Idempotence côté serveur (index)
+    await db.execute(text("ALTER TABLE reports ADD COLUMN IF NOT EXISTS idempotency_key text"))
     await db.execute(text(
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_reports_idem ON reports (idempotency_key) WHERE idempotency_key IS NOT NULL"
     ))
     await db.commit()
 
-    # 1) Enregistrer le report (avec géo). Retry anonymisé si FK user casse.
+    # 3) Enregistrer le report (retry anonymisé si FK user casse)
     try:
         await db.execute(text("""
             INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
@@ -227,7 +237,7 @@ async def post_report(
             ON CONFLICT (idempotency_key) DO NOTHING
         """), {
             "kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat,
-            "uid": uid, "idem": p.idempotency_key
+            "uid": uid, "idem": idem
         })
         await db.commit()
     except Exception as e:
@@ -242,20 +252,18 @@ async def post_report(
                 ON CONFLICT (idempotency_key) DO NOTHING
             """), {
                 "kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat,
-                "idem": p.idempotency_key
+                "idem": idem
             })
             await db.commit()
         else:
             await db.rollback()
             raise HTTPException(500, f"report insert failed: {e}")
 
-    # 2) Maintenir INCIDENTS (vérité pour la carte)
+    # 4) Maintenir INCIDENTS (vérité carte)
     if signal == "cut":
-        # Crée un incident s'il n'y en a pas déjà un actif à <=120 m
+        # crée un incident s'il n’y en a pas déjà un actif à <=120 m
         await db.execute(text("""
-            WITH me AS (
-              SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-            )
+            WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
             INSERT INTO incidents(kind, center, started_at, restored_at)
             SELECT :kind, (SELECT g FROM me), NOW(), NULL
             WHERE NOT EXISTS (
@@ -266,9 +274,12 @@ async def post_report(
             )
         """), {"kind": kind, "lng": p.lng, "lat": p.lat})
         await db.commit()
+
     else:  # RESTORED
-        # Ownership (si pas admin, on exige un CUT proche par le même user dans 24h)
-        if not is_admin and uid:
+        # 4.a) Clôture strictement réservée à l'auteur (sauf admin)
+        if not is_admin:
+            if not uid:
+                raise HTTPException(403, "auth_required")  # anonyme ne peut pas clôturer
             q = await db.execute(text("""
                 WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                 SELECT 1
@@ -282,11 +293,9 @@ async def post_report(
             if q.first() is None:
                 raise HTTPException(403, "not_owner")
 
-        # Ferme l'incident actif le plus proche (<=150 m)
+        # 4.b) Ferme l'incident actif le plus proche (<=150 m)
         await db.execute(text("""
-            WITH me AS (
-              SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-            )
+            WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
             UPDATE incidents i
                SET restored_at = COALESCE(i.restored_at, NOW())
              WHERE i.kind = :kind
@@ -295,8 +304,9 @@ async def post_report(
         """), {"kind": kind, "lng": p.lng, "lat": p.lat})
         await db.commit()
 
-    # 3) Les ZONES sont gérées par le service d’agrégation (aggregation.py)
-    return {"ok": True}
+    # 5) OK
+    return {"ok": True, "idempotency_key": idem}
+
 
 # --------- POST /reset_user ----------
 @router.post("/reset_user")

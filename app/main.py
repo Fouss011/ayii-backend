@@ -1,17 +1,19 @@
 # app/main.py
 from contextlib import asynccontextmanager
+import hashlib
+import os
+import pathlib
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-import os
 
 from app.db import get_db
 from app.services.aggregation import run_aggregation
 
-# Charger .env en local
+# Charger .env en local (hors Render)
 if os.getenv("RENDER") is None and os.getenv("ENV", "dev") == "dev":
     load_dotenv()
 
@@ -37,8 +39,12 @@ async def lifespan(app: FastAPI):
                 except Exception:
                     pass
 
-        scheduler.add_job(job, trigger=IntervalTrigger(minutes=interval),
-                          id="ayii_agg", replace_existing=True)
+        scheduler.add_job(
+            job,
+            trigger=IntervalTrigger(minutes=interval),
+            id="ayii_agg",
+            replace_existing=True,
+        )
         scheduler.start()
         print(f"[scheduler] started (every {interval} min)")
     else:
@@ -54,7 +60,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Ayii API", lifespan=lifespan)
 
-# debug token admin
+# debug token admin (masqué)
 tok = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
 print(f"[admin-token] len={len(tok)} head={tok[:4]} tail={tok[-4:]}")
 
@@ -69,11 +75,11 @@ app.add_middleware(
         "https://ayii.netlify.app",
         "http://localhost:3000",
     ],
-    allow_origin_regex=NETLIFY_REGEX,
-    allow_credentials=True,
+    allow_origin_regex=NETLIFY_REGEX,  # autorise les previews Netlify
+    allow_credentials=False,           # pas de cookies, plus simple pour CORS
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_headers=["Content-Type", "x-admin-token"],
+    expose_headers=[],
     max_age=86400,
 )
 
@@ -86,11 +92,7 @@ async def health():
 from app.routes.map import router as map_router
 from app.routes.dev import router as dev_router
 
-# Optionnels si présents ET s'ils n'entrent pas en collision avec /report ou /admin/*
-# from app.routes.report import router as report_router
-# from app.routes.admin import router as admin_router
-
-# Optionnels si présents
+# Optionnels si présents (protégés par try pour éviter durs imports)
 try:
     from app.routes.reverse import router as reverse_router
     app.include_router(reverse_router)
@@ -103,50 +105,40 @@ try:
 except Exception:
     pass
 
-# Router principal (contient /map, /report, /reset_user, /admin/*)
+# Router principal (contient /map, /report, /reset_user, etc.)
 app.include_router(map_router)
-
-# Éviter les collisions :
-# app.include_router(report_router, prefix="/legacy")
-# app.include_router(admin_router,  prefix="/legacy")
 
 # n’activer /dev/* qu’en dev
 if os.getenv("ENV", "dev") == "dev":
     app.include_router(dev_router)
 
-# (facultatif) exposer la liste des routes seulement en dev
-if os.getenv("ENV", "dev") == "dev":
-    @app.get("/__routes")
-    async def list_routes():
-        return sorted([r.path for r in app.routes])
-
-# versioning fichiers pour debug
-import hashlib, pathlib
-
-def _sha(path):
+# (facultatif) exposer la liste des routes et versions seulement en dev
+def _sha(path: str):
     p = pathlib.Path(path)
     if not p.exists():
         return None
     return hashlib.sha1(p.read_bytes()).hexdigest()[:12]
 
-@app.get("/__version")
-async def version():
-    import os as _os
-    return {
-        "ENV": _os.getenv("ENV"),
-        "SCHEDULER_ENABLED": _os.getenv("SCHEDULER_ENABLED"),
-        "AGG_INTERVAL_MIN": _os.getenv("AGG_INTERVAL_MIN"),
-        "files": {
-            "aggregation.py": _sha("app/services/aggregation.py"),
-            "crud.py": _sha("app/crud.py"),
-            "db.py": _sha("app/db.py"),
-            "main.py": _sha("app/main.py"),
+if os.getenv("ENV", "dev") == "dev":
+    @app.get("/__routes")
+    async def list_routes():
+        return sorted([r.path for r in app.routes])
+
+    @app.get("/__version")
+    async def version():
+        return {
+            "ENV": os.getenv("ENV"),
+            "SCHEDULER_ENABLED": os.getenv("SCHEDULER_ENABLED"),
+            "AGG_INTERVAL_MIN": os.getenv("AGG_INTERVAL_MIN"),
+            "files": {
+                "aggregation.py": _sha("app/services/aggregation.py"),
+                "crud.py": _sha("app/crud.py"),
+                "db.py": _sha("app/db.py"),
+                "main.py": _sha("app/main.py"),
+            },
         }
-    }
 
-# no-store pour /map
-from fastapi import Response, Request
-
+# no-store pour /map (évite cache côté CDN/navigateur)
 @app.middleware("http")
 async def no_store_cache(request: Request, call_next):
     response: Response = await call_next(request)
