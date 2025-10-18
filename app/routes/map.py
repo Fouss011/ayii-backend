@@ -258,6 +258,7 @@ async def post_report(
         else:
             await db.rollback()
             raise HTTPException(500, f"report insert failed: {e}")
+        
 
     # 4) Maintenir INCIDENTS (vérité carte)
     if signal == "cut":
@@ -307,6 +308,11 @@ async def post_report(
     # 5) OK
     return {"ok": True, "idempotency_key": idem}
 
+
+@router.options("/report")
+async def options_report():
+    # Répond vite au préflight CORS
+    return Response(status_code=204)
 
 # --------- POST /reset_user ----------
 @router.post("/reset_user")
