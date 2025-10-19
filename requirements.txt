@@ -6,3 +6,4 @@ psycopg[binary]==3.2.1
 apscheduler==3.10.4
 python-dotenv==1.0.1
 certifi==2024.7.4
+python-multipart>=0.0.7
