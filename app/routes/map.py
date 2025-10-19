@@ -1,33 +1,32 @@
 # app/routes/map.py
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request, Header
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request, Header, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from typing import Optional
 from app.db import get_db
-import os, uuid
-import hashlib, time
-
+import os, uuid, mimetypes
 
 router = APIRouter()
 
 # --------- Config ----------
-POINTS_WINDOW_MIN   = int(os.getenv("POINTS_WINDOW_MIN", "240"))
-MAX_REPORTS         = int(os.getenv("MAX_REPORTS", "500"))
-RESTORE_RADIUS_M    = int(os.getenv("RESTORE_RADIUS_M", "200"))
-CLEANUP_RADIUS_M    = int(os.getenv("CLEANUP_RADIUS_M", "80"))
-ADMIN_TOKEN         = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
+POINTS_WINDOW_MIN    = int(os.getenv("POINTS_WINDOW_MIN", "240"))
+MAX_REPORTS          = int(os.getenv("MAX_REPORTS", "500"))
+RESTORE_RADIUS_M     = int(os.getenv("RESTORE_RADIUS_M", "200"))
+CLEANUP_RADIUS_M     = int(os.getenv("CLEANUP_RADIUS_M", "80"))
+OWNERSHIP_RADIUS_M   = int(os.getenv("OWNERSHIP_RADIUS_M", "150"))
+OWNERSHIP_WINDOW_MIN = int(os.getenv("OWNERSHIP_WINDOW_MIN", "1440"))  # 24h
+ADMIN_TOKEN          = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
 
-# Ownership: seul l’auteur du CUT proche (et récent) peut RESTORE
-OWNERSHIP_RADIUS_M  = int(os.getenv("OWNERSHIP_RADIUS_M", "150"))     # rayon d’association
-OWNERSHIP_WINDOW_MIN= int(os.getenv("OWNERSHIP_WINDOW_MIN", "1440"))  # 24h
+# Pièces jointes + auto-expire
+ATTACH_WINDOW_H      = int(os.getenv("ATTACH_WINDOW_H", "48"))  # photos visibles près d’un incident sur 48h
+AUTO_EXPIRE_H        = int(os.getenv("AUTO_EXPIRE_H", "6"))     # auto-clôture à 6h
 
-def _check_admin_token(request: Request):
-    if ADMIN_TOKEN:
-        tok = request.headers.get("x-admin-token", "")
-        if tok != ADMIN_TOKEN:
-            raise HTTPException(status_code=401, detail="Invalid admin token")
+SUPABASE_URL         = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_KEY         = os.getenv("SUPABASE_SERVICE_ROLE", "")
+SUPABASE_BUCKET      = os.getenv("SUPABASE_BUCKET", "attachments")
 
+# --------- Helpers ----------
 def _to_uuid_or_none(val: Optional[str]):
     try:
         if not val:
@@ -36,36 +35,59 @@ def _to_uuid_or_none(val: Optional[str]):
     except Exception:
         return None
 
-# --------- Helpers lecture ----------
+def _check_admin_token(request: Request):
+    if ADMIN_TOKEN:
+        tok = request.headers.get("x-admin-token", "")
+        if tok != ADMIN_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid admin token")
+
+@router.options("/report")
+async def options_report():
+    return Response(status_code=204)
+
+# --------- Upload vers Supabase Storage ----------
+async def _upload_to_supabase(file_bytes: bytes, filename: str, content_type: str) -> str:
+    if not (SUPABASE_URL and SUPABASE_KEY):
+        raise HTTPException(status_code=500, detail="supabase creds missing")
+    import httpx, time
+    path = f"{int(time.time())}/{uuid.uuid4()}-{filename}"
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": content_type or "application/octet-stream",
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(upload_url, headers=headers, content=file_bytes)
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=500, detail=f"supabase upload failed: {r.text}")
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
+
+# --------- Lecture incidents / outages avec compteur d’images ----------
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
-    q_full = text("""
+    q_full = text(f"""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-        SELECT id, kind::text AS kind,
-               CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-               ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
-               started_at, restored_at
-        FROM outages
-        WHERE ST_DWithin(center, (SELECT g FROM me), :r)
-        ORDER BY started_at DESC
-    """)
-    q_min = text("""
-        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-        SELECT id, kind::text AS kind, 'active' AS status,
-               ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
-               NULL::timestamp AS started_at, NULL::timestamp AS restored_at
-        FROM outages
-        WHERE ST_DWithin(center, (SELECT g FROM me), :r)
-        ORDER BY id DESC
+        SELECT o.id,
+               o.kind::text AS kind,
+               CASE WHEN o.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+               ST_Y(o.center::geometry) AS lat, ST_X(o.center::geometry) AS lng,
+               o.started_at, o.restored_at,
+               COALESCE(att.cnt, 0) AS attachments_count
+        FROM outages o
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS cnt
+            FROM attachments a
+           WHERE a.kind = o.kind
+             AND a.created_at > NOW() - INTERVAL '{ATTACH_WINDOW_H} hours'
+             AND ST_DWithin(a.geom, o.center, 120)
+        ) att ON TRUE
+        WHERE ST_DWithin(o.center, (SELECT g FROM me), :r)
+        ORDER BY o.started_at DESC NULLS LAST, o.id DESC
     """)
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
     except Exception as e:
-        if "UndefinedColumn" in str(e) or "does not exist" in str(e):
-            await db.rollback()
-            res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
-        else:
-            await db.rollback()
-            raise
+        await db.rollback()
+        raise
     rows = res.fetchall()
     return [
         {
@@ -73,38 +95,35 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
             "lat": float(r.lat), "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
+            "attachments_count": int(getattr(r, "attachments_count", 0)),
         } for r in rows
     ]
 
 async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
-    q_full = text("""
+    q_full = text(f"""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-        SELECT id, kind::text AS kind,
-               CASE WHEN restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-               ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
-               started_at, restored_at
-        FROM incidents
-        WHERE ST_DWithin(center, (SELECT g FROM me), :r)
-        ORDER BY started_at DESC
-    """)
-    q_min = text("""
-        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-        SELECT id, kind::text AS kind, 'active' AS status,
-               ST_Y(center::geometry) AS lat, ST_X(center::geometry) AS lng,
-               NULL::timestamp AS started_at, NULL::timestamp AS restored_at
-        FROM incidents
-        WHERE ST_DWithin(center, (SELECT g FROM me), :r)
-        ORDER BY id DESC
+        SELECT i.id,
+               i.kind::text AS kind,
+               CASE WHEN i.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+               ST_Y(i.center::geometry) AS lat, ST_X(i.center::geometry) AS lng,
+               i.started_at, i.restored_at,
+               COALESCE(att.cnt, 0) AS attachments_count
+        FROM incidents i
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS cnt
+            FROM attachments a
+           WHERE a.kind = i.kind
+             AND a.created_at > NOW() - INTERVAL '{ATTACH_WINDOW_H} hours'
+             AND ST_DWithin(a.geom, i.center, 120)
+        ) att ON TRUE
+        WHERE ST_DWithin(i.center, (SELECT g FROM me), :r)
+        ORDER BY i.started_at DESC NULLS LAST, i.id DESC
     """)
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
     except Exception as e:
-        if "UndefinedColumn" in str(e) or "does not exist" in str(e):
-            await db.rollback()
-            res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
-        else:
-            await db.rollback()
-            raise
+        await db.rollback()
+        raise
     rows = res.fetchall()
     return [
         {
@@ -112,6 +131,7 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
             "lat": float(r.lat), "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
+            "attachments_count": int(getattr(r, "attachments_count", 0)),
         } for r in rows
     ]
 
@@ -125,10 +145,19 @@ async def map_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     try:
+        # 0) Auto-clôture > AUTO_EXPIRE_H (incidents + outages)
         try:
-            await db.rollback()
+            await db.execute(text(f"""
+                UPDATE incidents SET restored_at = COALESCE(restored_at, NOW())
+                WHERE restored_at IS NULL AND started_at < NOW() - INTERVAL '{AUTO_EXPIRE_H} hours'
+            """))
+            await db.execute(text(f"""
+                UPDATE outages SET restored_at = COALESCE(restored_at, NOW())
+                WHERE restored_at IS NULL AND started_at < NOW() - INTERVAL '{AUTO_EXPIRE_H} hours'
+            """))
+            await db.commit()
         except Exception:
-            pass
+            await db.rollback()  # on ne bloque pas /map si ça échoue
 
         r_m = float(radius_km * 1000.0)
         outages   = await fetch_outages(db, lat, lng, r_m)
@@ -148,7 +177,6 @@ async def map_endpoint(
             LIMIT :max
         """)
         res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
-
         last_reports = [
             {
                 "id": r.id, "kind": r.kind, "signal": r.signal,
@@ -175,14 +203,14 @@ async def map_endpoint(
             pass
         raise HTTPException(status_code=500, detail=str(e))
 
+# --------- POST /report ----------
 class ReportIn(BaseModel):
     kind: str            # "power" | "water" | "traffic" | "accident" | "fire" | "flood"
     signal: str          # "cut" | "restored"
     lat: float
     lng: float
     user_id: Optional[str] = None
-    idempotency_key: Optional[str] = None  # facultative (on la génère si absente)
-
+    idempotency_key: Optional[str] = None
 
 @router.post("/report")
 async def post_report(
@@ -199,17 +227,9 @@ async def post_report(
 
     uid = _to_uuid_or_none(p.user_id)
     is_admin = (x_admin_token or "").strip() == ADMIN_TOKEN
+    idem = (p.idempotency_key or "").strip() or None
 
-    # 0) Idempotence serveur (si le front n’en envoie pas)
-    #    clé = sha1(kind|signal|lat|lng|uid/anon|bucket5s)
-    if p.idempotency_key and len(p.idempotency_key) >= 8:
-        idem = p.idempotency_key
-    else:
-        bucket5s = int(time.time() // 5)
-        base = f"{kind}|{signal}|{round(p.lat,5)}|{round(p.lng,5)}|{uid or 'anon'}|{bucket5s}"
-        idem = hashlib.sha1(base.encode()).hexdigest()
-
-    # 1) Upsert user (évite FK cassée)
+    # Upsert user pour éviter FK cassée
     if uid:
         try:
             await db.execute(
@@ -220,31 +240,18 @@ async def post_report(
         except Exception:
             await db.rollback()
 
-    # 2) Idempotence côté serveur (index)
-    await db.execute(text("ALTER TABLE reports ADD COLUMN IF NOT EXISTS idempotency_key text"))
-    await db.execute(text(
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_reports_idem ON reports (idempotency_key) WHERE idempotency_key IS NOT NULL"
-    ))
-    await db.commit()
-
-        # 3) Enregistrer le report (idempotence sans ON CONFLICT)
+    # 1) Enregistrer le report (idempotence logique ; marche même sans index unique)
     try:
-        # insert avec idempotence logique (pas besoin d'unique index pour marcher)
         await db.execute(text("""
             INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
             SELECT :kind, :signal,
                    ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
                    CAST(:uid AS uuid), NOW(), :idem
-            WHERE NOT EXISTS (
-              SELECT 1 FROM reports WHERE idempotency_key = :idem
-            )
-        """), {
-            "kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat,
-            "uid": uid, "idem": idem
-        })
+            WHERE :idem IS NULL
+               OR NOT EXISTS (SELECT 1 FROM reports WHERE idempotency_key = :idem)
+        """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": uid, "idem": idem})
         await db.commit()
     except Exception as e:
-        # retry anonymisé si FK user casse (mais on garde la même idempotence)
         msg = str(e).lower()
         if ("foreignkey" in msg or "user_id" in msg) and uid:
             await db.rollback()
@@ -253,40 +260,32 @@ async def post_report(
                 SELECT :kind, :signal,
                        ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
                        NULL, NOW(), :idem
-                WHERE NOT EXISTS (
-                  SELECT 1 FROM reports WHERE idempotency_key = :idem
-                )
-            """), {
-                "kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat,
-                "idem": idem
-            })
+                WHERE :idem IS NULL
+                   OR NOT EXISTS (SELECT 1 FROM reports WHERE idempotency_key = :idem)
+            """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "idem": idem})
             await db.commit()
         else:
             await db.rollback()
             raise HTTPException(500, f"report insert failed: {e}")
 
-
-    # 4) Maintenir INCIDENTS (vérité carte)
+    # 2) Maintenir INCIDENTS / OUTAGES (vérité carte)
     if signal == "cut":
-        # crée un incident s'il n’y en a pas déjà un actif à <=120 m
-        await db.execute(text("""
+        target = "outages" if kind in ("power","water") else "incidents"
+        await db.execute(text(f"""
             WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-            INSERT INTO incidents(kind, center, started_at, restored_at)
+            INSERT INTO {target}(kind, center, started_at, restored_at)
             SELECT :kind, (SELECT g FROM me), NOW(), NULL
             WHERE NOT EXISTS (
-              SELECT 1 FROM incidents i
+              SELECT 1 FROM {target} i
                WHERE i.kind = :kind
                  AND i.restored_at IS NULL
                  AND ST_DWithin(i.center, (SELECT g FROM me), 120)
             )
         """), {"kind": kind, "lng": p.lng, "lat": p.lat})
         await db.commit()
-
-    else:  # RESTORED
-        # 4.a) Clôture strictement réservée à l'auteur (sauf admin)
-        if not is_admin:
-            if not uid:
-                raise HTTPException(403, "auth_required")  # anonyme ne peut pas clôturer
+    else:
+        # RESTORED : Ownership (hors admin)
+        if not is_admin and uid:
             q = await db.execute(text("""
                 WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                 SELECT 1
@@ -294,16 +293,16 @@ async def post_report(
                  WHERE r.kind=:kind AND lower(trim(r.signal))='cut'
                    AND r.user_id = CAST(:uid AS uuid)
                    AND r.created_at >= NOW() - INTERVAL '24 hours'
-                   AND ST_DWithin(r.geom, (SELECT g FROM me), 150)
+                   AND ST_DWithin(r.geom, (SELECT g FROM me), :ownr)
                  LIMIT 1
-            """), {"kind": kind, "uid": uid, "lng": p.lng, "lat": p.lat})
+            """), {"kind": kind, "uid": uid, "lng": p.lng, "lat": p.lat, "ownr": OWNERSHIP_RADIUS_M})
             if q.first() is None:
                 raise HTTPException(403, "not_owner")
 
-        # 4.b) Ferme l'incident actif le plus proche (<=150 m)
-        await db.execute(text("""
+        target = "outages" if kind in ("power","water") else "incidents"
+        await db.execute(text(f"""
             WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-            UPDATE incidents i
+            UPDATE {target} i
                SET restored_at = COALESCE(i.restored_at, NOW())
              WHERE i.kind = :kind
                AND i.restored_at IS NULL
@@ -311,16 +310,46 @@ async def post_report(
         """), {"kind": kind, "lng": p.lng, "lat": p.lat})
         await db.commit()
 
-    # 5) OK
     return {"ok": True, "idempotency_key": idem}
 
+# --------- Upload image ----------
+@router.post("/upload_image")
+async def upload_image(
+    kind: str = Form(...),
+    lat: float = Form(...),
+    lng: float = Form(...),
+    idempotency_key: Optional[str] = Form(None),
+    user_id: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    k = (kind or "").lower().strip()
+    if k not in {"traffic","accident","fire","flood","power","water"}:
+        raise HTTPException(400, "invalid kind")
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        raise HTTPException(400, "invalid coordinates")
 
-@router.options("/report")
-async def options_report():
-    # Répond vite au préflight CORS
-    return Response(status_code=204)
+    ct = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+    if not ct.startswith("image/"):
+        raise HTTPException(400, "only image/* allowed")
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(413, "file too large (max 5MB)")
 
-# --------- POST /reset_user ----------
+    url = await _upload_to_supabase(content, file.filename or "photo.jpg", ct)
+
+    uid = _to_uuid_or_none(user_id)
+
+    await db.execute(text("""
+        INSERT INTO attachments(kind, url, geom, user_id, idempotency_key, created_at)
+        VALUES (:kind, :url, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography, CAST(:uid AS uuid), :idem, NOW())
+        ON CONFLICT (idempotency_key, url) DO NOTHING
+    """), {"kind": k, "url": url, "lng": lng, "lat": lat, "uid": uid, "idem": idempotency_key})
+    await db.commit()
+
+    return {"ok": True, "url": url}
+
+# --------- RESET USER ----------
 @router.post("/reset_user")
 async def reset_user(id: str = Query(..., alias="id"), db: AsyncSession = Depends(get_db)):
     try:
@@ -333,6 +362,9 @@ async def reset_user(id: str = Query(..., alias="id"), db: AsyncSession = Depend
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"reset_user failed: {e}")
+
+# --------- ADMIN (identiques à avant, conservés) ----------
+# ... (garde tes endpoints admin existants inchangés)
 
 # --------- ADMIN maintenance ----------
 @router.post("/admin/wipe_all")
@@ -849,6 +881,45 @@ async def admin_export_events_geojson(
     buf.seek(0)
     return StreamingResponse(buf, media_type="application/geo+json",
         headers={"Content-Disposition": "attachment; filename=events.geojson"})
+
+from typing import List
+from fastapi import Query
+
+@router.get("/attachments_near")
+async def attachments_near(
+    kind: str = Query(...),
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    radius_m: int = Query(150, ge=10, le=1000),
+    hours: int = Query(48, ge=1, le=168),
+    db: AsyncSession = Depends(get_db),
+):
+    k = (kind or "").strip().lower()
+    if k not in {"traffic","accident","fire","flood","power","water"}:
+        raise HTTPException(status_code=400, detail="invalid kind")
+
+    res = await db.execute(text(f"""
+        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+        SELECT id, url, ST_Y(geom::geometry) AS lat, ST_X(geom::geometry) AS lng,
+               user_id, created_at
+          FROM attachments
+         WHERE kind = :kind
+           AND created_at > NOW() - INTERVAL '{hours} hours'
+           AND ST_DWithin(geom, (SELECT g FROM me), :r)
+         ORDER BY created_at DESC, id DESC
+         LIMIT 200
+    """), {"kind": k, "lng": lng, "lat": lat, "r": radius_m})
+    rows = res.fetchall()
+    return [
+        {
+            "id": r.id,
+            "url": r.url,
+            "lat": float(r.lat),
+            "lng": float(r.lng),
+            "user_id": r.user_id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        } for r in rows
+    ]
 
 
 @router.get("/admin/export_aggregated.csv")

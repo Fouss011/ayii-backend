@@ -20,17 +20,44 @@ MATCH_RESTORE_M = int(os.getenv("OUTAGE_RESTORE_MATCH_M", "350"))
 # Cooldown to avoid re-opening a just-restored zone too fast (minutes)
 COOLDOWN_AFTER_RESTORE_MIN = int(os.getenv("OUTAGE_COOLDOWN_MIN", "5"))
 
+# NEW: auto-expire active incidents/outages after N hours (strict)
+AUTO_EXPIRE_HOURS = int(os.getenv("AUTO_EXPIRE_HOURS", "6"))
+
 async def run_aggregation(db: AsyncSession) -> None:
     """Rebuild active outages from recent CUT reports and strictly close them when:
       - a RESTORED report is seen near the zone, OR
       - the number of recent CUT reports supporting the zone goes below MIN_REPORTS.
-    Also expires incidents/outages via crud helpers when enabled."""
+    Also expire incidents/outages after AUTO_EXPIRE_HOURS and via crud helpers when enabled.
+    """
 
     # 0) Safety: ensure columns
     await db.execute(text("ALTER TABLE outages  ADD COLUMN IF NOT EXISTS started_at timestamp NULL"))
     await db.execute(text("ALTER TABLE outages  ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
     await db.execute(text("ALTER TABLE incidents ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
     await db.commit()
+
+    # 0-bis) STRICT AUTO-EXPIRATION after N hours (default 6h)
+    try:
+        res_i = await db.execute(text(f"""
+            UPDATE incidents
+               SET restored_at = COALESCE(restored_at, NOW())
+             WHERE restored_at IS NULL
+               AND started_at <= NOW() - INTERVAL '{AUTO_EXPIRE_HOURS} hours'
+        """))
+        res_o = await db.execute(text(f"""
+            UPDATE outages
+               SET restored_at = COALESCE(restored_at, NOW())
+             WHERE restored_at IS NULL
+               AND started_at <= NOW() - INTERVAL '{AUTO_EXPIRE_HOURS} hours'
+        """))
+        if LOG_AGG:
+            print(f"[agg] auto-expire incidents -> {res_i.rowcount or 0}")
+            print(f"[agg] auto-expire outages   -> {res_o.rowcount or 0}")
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        if LOG_AGG:
+            print(f"[agg] auto-expire error: {e}")
 
     # 1) Close zones that received any RESTORED near them (strict)
     close_by_restore = text(f"""
@@ -125,7 +152,7 @@ async def run_aggregation(db: AsyncSession) -> None:
     await db.execute(create_or_refresh)
     await db.commit()
 
-    # 5) Housekeeping (optional)
+    # 5) Housekeeping (optional via your helpers)
     try:
         c1 = await expire_stale_outages(db)
     except Exception:
