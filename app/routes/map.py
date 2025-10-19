@@ -287,33 +287,30 @@ async def post_report(
         except Exception:
             await db.rollback()
 
-    # 1) Enregistrer le report (idempotence logique ; marche même sans index unique)
+        # 1) Enregistrer le report (idempotence logique ; marche même sans index unique)
     try:
         await db.execute(text("""
             INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
-            SELECT :kind, :signal,
-                   ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                   CAST(:uid AS uuid), NOW(), :idem
-            WHERE :idem IS NULL
-               OR NOT EXISTS (SELECT 1 FROM reports WHERE idempotency_key = :idem)
-        """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": uid, "idem": idem})
+            SELECT
+                :kind::text,
+                :signal::text,
+                ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                CAST(NULLIF(:uid,'') AS uuid),
+                NOW(),
+                NULLIF(:idem,'')::text
+            WHERE
+                -- si pas d'idem, on insère
+                (:idem IS NULL OR :idem = '')
+                -- sinon on n'insère que si l'idem n'existe pas déjà
+                OR NOT EXISTS (
+                    SELECT 1 FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text
+                )
+        """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": (uid or ""), "idem": idem})
         await db.commit()
     except Exception as e:
-        msg = str(e).lower()
-        if ("foreignkey" in msg or "user_id" in msg) and uid:
-            await db.rollback()
-            await db.execute(text("""
-                INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
-                SELECT :kind, :signal,
-                       ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                       NULL, NOW(), :idem
-                WHERE :idem IS NULL
-                   OR NOT EXISTS (SELECT 1 FROM reports WHERE idempotency_key = :idem)
-            """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "idem": idem})
-            await db.commit()
-        else:
-            await db.rollback()
-            raise HTTPException(500, f"report insert failed: {e}")
+        await db.rollback()
+        raise HTTPException(500, f"report insert failed: {e}")
+
 
     # 2) Maintenir INCIDENTS / OUTAGES (vérité carte)
     if signal == "cut":
@@ -389,9 +386,9 @@ async def upload_image(
 
     await db.execute(text("""
         INSERT INTO attachments(kind, url, geom, user_id, idempotency_key, created_at)
-        VALUES (:kind, :url, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography, CAST(:uid AS uuid), :idem, NOW())
+        VALUES (:kind, :url, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography, CAST(NULLIF(:uid,'') AS uuid), :idem, NOW())
         ON CONFLICT (idempotency_key, url) DO NOTHING
-    """), {"kind": k, "url": url, "lng": lng, "lat": lat, "uid": uid, "idem": idempotency_key})
+    """), {"kind": k, "url": url, "lng": lng, "lat": lat, "uid": (uid or ""), "idem": idempotency_key})
     await db.commit()
 
     return {"ok": True, "url": url}
