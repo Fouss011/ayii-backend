@@ -9,6 +9,13 @@ import os, uuid, mimetypes
 
 router = APIRouter()
 
+# Preflight CORS pour l’upload d’image
+@router.options("/upload_image")
+async def options_upload_image():
+    from fastapi import Response
+    return Response(status_code=204)
+
+
 # --------- Config ----------
 POINTS_WINDOW_MIN    = int(os.getenv("POINTS_WINDOW_MIN", "240"))
 MAX_REPORTS          = int(os.getenv("MAX_REPORTS", "500"))
