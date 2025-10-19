@@ -63,31 +63,52 @@ async def _upload_to_supabase(file_bytes: bytes, filename: str, content_type: st
     return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
 
 # --------- Lecture incidents / outages avec compteur d’images ----------
+# --------- Helpers lecture ----------
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
-    q_full = text(f"""
+    # Version avec compteur d'attachments, robuste aux différences de type (text vs enum)
+    q_full = text("""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
         SELECT o.id,
                o.kind::text AS kind,
                CASE WHEN o.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
                ST_Y(o.center::geometry) AS lat, ST_X(o.center::geometry) AS lng,
                o.started_at, o.restored_at,
-               COALESCE(att.cnt, 0) AS attachments_count
+               COALESCE(att.cnt, 0)::int AS attachments_count
         FROM outages o
         LEFT JOIN LATERAL (
           SELECT COUNT(*)::int AS cnt
             FROM attachments a
-           WHERE a.kind = o.kind
-             AND a.created_at > NOW() - INTERVAL '{ATTACH_WINDOW_H} hours'
-             AND ST_DWithin(a.geom, o.center, 120)
+           WHERE a.kind::text = o.kind::text
+             AND a.created_at > NOW() - INTERVAL '48 hours'
+             AND ST_DWithin((a.geom)::geography, o.center, 120)
         ) att ON TRUE
+        WHERE ST_DWithin(o.center, (SELECT g FROM me), :r)
+        ORDER BY o.started_at DESC NULLS LAST, o.id DESC
+    """)
+    # Fallback si la table attachments n’existe pas
+    q_min = text("""
+        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+        SELECT o.id,
+               o.kind::text AS kind,
+               CASE WHEN o.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+               ST_Y(o.center::geometry) AS lat, ST_X(o.center::geometry) AS lng,
+               o.started_at, o.restored_at,
+               0::int AS attachments_count
+        FROM outages o
         WHERE ST_DWithin(o.center, (SELECT g FROM me), :r)
         ORDER BY o.started_at DESC NULLS LAST, o.id DESC
     """)
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
     except Exception as e:
-        await db.rollback()
-        raise
+        # Si la table/colonne n’existe pas encore, on fallback
+        msg = str(e)
+        if "relation \"attachments\" does not exist" in msg.lower() or "UndefinedTable" in msg or "does not exist" in msg:
+            await db.rollback()
+            res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
+        else:
+            await db.rollback()
+            raise
     rows = res.fetchall()
     return [
         {
@@ -95,35 +116,53 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
             "lat": float(r.lat), "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
-            "attachments_count": int(getattr(r, "attachments_count", 0)),
+            "attachments_count": getattr(r, "attachments_count", 0)
         } for r in rows
     ]
 
+
 async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
-    q_full = text(f"""
+    q_full = text("""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
         SELECT i.id,
                i.kind::text AS kind,
                CASE WHEN i.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
                ST_Y(i.center::geometry) AS lat, ST_X(i.center::geometry) AS lng,
                i.started_at, i.restored_at,
-               COALESCE(att.cnt, 0) AS attachments_count
+               COALESCE(att.cnt, 0)::int AS attachments_count
         FROM incidents i
         LEFT JOIN LATERAL (
           SELECT COUNT(*)::int AS cnt
             FROM attachments a
-           WHERE a.kind = i.kind
-             AND a.created_at > NOW() - INTERVAL '{ATTACH_WINDOW_H} hours'
-             AND ST_DWithin(a.geom, i.center, 120)
+           WHERE a.kind::text = i.kind::text
+             AND a.created_at > NOW() - INTERVAL '48 hours'
+             AND ST_DWithin((a.geom)::geography, i.center, 120)
         ) att ON TRUE
+        WHERE ST_DWithin(i.center, (SELECT g FROM me), :r)
+        ORDER BY i.started_at DESC NULLS LAST, i.id DESC
+    """)
+    q_min = text("""
+        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+        SELECT i.id,
+               i.kind::text AS kind,
+               CASE WHEN i.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+               ST_Y(i.center::geometry) AS lat, ST_X(i.center::geometry) AS lng,
+               i.started_at, i.restored_at,
+               0::int AS attachments_count
+        FROM incidents i
         WHERE ST_DWithin(i.center, (SELECT g FROM me), :r)
         ORDER BY i.started_at DESC NULLS LAST, i.id DESC
     """)
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
     except Exception as e:
-        await db.rollback()
-        raise
+        msg = str(e)
+        if "relation \"attachments\" does not exist" in msg.lower() or "UndefinedTable" in msg or "does not exist" in msg:
+            await db.rollback()
+            res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
+        else:
+            await db.rollback()
+            raise
     rows = res.fetchall()
     return [
         {
@@ -131,9 +170,10 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
             "lat": float(r.lat), "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
-            "attachments_count": int(getattr(r, "attachments_count", 0)),
+            "attachments_count": getattr(r, "attachments_count", 0)
         } for r in rows
     ]
+
 
 # --------- GET /map ----------
 @router.get("/map")
