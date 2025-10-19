@@ -227,29 +227,35 @@ async def post_report(
     ))
     await db.commit()
 
-    # 3) Enregistrer le report (retry anonymisé si FK user casse)
+        # 3) Enregistrer le report (idempotence sans ON CONFLICT)
     try:
+        # insert avec idempotence logique (pas besoin d'unique index pour marcher)
         await db.execute(text("""
             INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
-            VALUES (:kind, :signal,
-                    ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                    CAST(:uid AS uuid), NOW(), :idem)
-            ON CONFLICT (idempotency_key) DO NOTHING
+            SELECT :kind, :signal,
+                   ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                   CAST(:uid AS uuid), NOW(), :idem
+            WHERE NOT EXISTS (
+              SELECT 1 FROM reports WHERE idempotency_key = :idem
+            )
         """), {
             "kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat,
             "uid": uid, "idem": idem
         })
         await db.commit()
     except Exception as e:
+        # retry anonymisé si FK user casse (mais on garde la même idempotence)
         msg = str(e).lower()
         if ("foreignkey" in msg or "user_id" in msg) and uid:
             await db.rollback()
             await db.execute(text("""
                 INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
-                VALUES (:kind, :signal,
-                        ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                        NULL, NOW(), :idem)
-                ON CONFLICT (idempotency_key) DO NOTHING
+                SELECT :kind, :signal,
+                       ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                       NULL, NOW(), :idem
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM reports WHERE idempotency_key = :idem
+                )
             """), {
                 "kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat,
                 "idem": idem
@@ -258,7 +264,7 @@ async def post_report(
         else:
             await db.rollback()
             raise HTTPException(500, f"report insert failed: {e}")
-        
+
 
     # 4) Maintenir INCIDENTS (vérité carte)
     if signal == "cut":
