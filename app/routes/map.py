@@ -265,6 +265,7 @@ async def post_report(
     db: AsyncSession = Depends(get_db),
     x_admin_token: Optional[str] = Header(default=None)
 ):
+    # --- Normalisation & validations ---
     kind = (p.kind or "").lower().strip()
     signal = (p.signal or "").lower().strip()
     if kind not in {"power","water","traffic","accident","fire","flood"}:
@@ -272,11 +273,11 @@ async def post_report(
     if signal not in {"cut","restored"}:
         raise HTTPException(400, "invalid signal")
 
-    uid = _to_uuid_or_none(p.user_id)
-    is_admin = (x_admin_token or "").strip() == ADMIN_TOKEN
+    uid = _to_uuid_or_none(p.user_id)              # UUID ou None
     idem = (p.idempotency_key or "").strip() or None
+    is_admin = (x_admin_token or "").strip() == ADMIN_TOKEN
 
-    # Upsert user pour éviter FK cassée
+    # --- Upsert user pour éviter les FK cassées si uid présent ---
     if uid:
         try:
             await db.execute(
@@ -287,9 +288,9 @@ async def post_report(
         except Exception:
             await db.rollback()
 
-        # 1) Enregistrer le report (idempotence logique ; marche même sans index unique)
+    # --- INSERT report (idempotent) : typage explicite pour éviter AmbiguousParameter ---
     try:
-        await db.execute(text("""
+        sql = text("""
             INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
             SELECT
                 :kind::text,
@@ -301,18 +302,38 @@ async def post_report(
             WHERE
                 -- si pas d'idem, on insère
                 (:idem IS NULL OR :idem = '')
-                -- sinon on n'insère que si l'idem n'existe pas déjà
+                -- sinon, on n'insère que si l'idem n'existe pas déjà
                 OR NOT EXISTS (
                     SELECT 1 FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text
                 )
-        """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": (uid or ""), "idem": idem})
+            RETURNING id
+        """)
+        params = {
+            "kind":   kind,
+            "signal": signal,
+            "lng":    float(p.lng),
+            "lat":    float(p.lat),
+            "uid":    (uid or ""),     # "" -> NULL via NULLIF, puis CAST uuid OK
+            "idem":   idem             # peut être None
+        }
+        res = await db.execute(sql, params)
+        row = res.first()
         await db.commit()
+
+        # Si pas de row (doublon idem), récupérer l'id existant
+        if not row and (idem or ""):
+            res2 = await db.execute(text("""
+                SELECT id FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text
+            """), {"idem": idem})
+            row = res2.first()
+
+        report_id = row[0] if row else None
+
     except Exception as e:
         await db.rollback()
         raise HTTPException(500, f"report insert failed: {e}")
 
-
-    # 2) Maintenir INCIDENTS / OUTAGES (vérité carte)
+    # --- Maintien des tables évènementielles (incidents/outages) ---
     if signal == "cut":
         target = "outages" if kind in ("power","water") else "incidents"
         await db.execute(text(f"""
@@ -328,7 +349,7 @@ async def post_report(
         """), {"kind": kind, "lng": p.lng, "lat": p.lat})
         await db.commit()
     else:
-        # RESTORED : Ownership (hors admin)
+        # RESTORED : contrôle d'ownership (hors admin), seulement si uid présent
         if not is_admin and uid:
             q = await db.execute(text("""
                 WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
@@ -354,7 +375,8 @@ async def post_report(
         """), {"kind": kind, "lng": p.lng, "lat": p.lat})
         await db.commit()
 
-    return {"ok": True, "idempotency_key": idem}
+    return {"ok": True, "id": report_id, "idempotency_key": idem}
+
 
 # --------- Upload image ----------
 @router.post("/upload_image")
