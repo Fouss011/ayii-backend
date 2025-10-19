@@ -277,7 +277,7 @@ async def post_report(
     idem = (p.idempotency_key or "").strip() or None
     is_admin = (x_admin_token or "").strip() == ADMIN_TOKEN
 
-    # --- Upsert user pour éviter les FK cassées si uid présent ---
+    # --- Upsert user (si uid) pour éviter FK cassée ---
     if uid:
         try:
             await db.execute(
@@ -288,34 +288,36 @@ async def post_report(
         except Exception:
             await db.rollback()
 
-    # --- INSERT report (idempotent) : typage explicite pour éviter AmbiguousParameter ---
+    # --- INSERT report (idempotent) -> utilise CAST() (pas ::) et passe TOUS les params ---
     try:
         sql = text("""
             INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
             SELECT
-                :kind::text,
-                :signal::text,
-                ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                CAST(NULLIF(:uid,'') AS uuid),
+                CAST(:kind   AS text),
+                CAST(:signal AS text),
+                ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
+                CAST(NULLIF(:uid, '') AS uuid),
                 NOW(),
-                NULLIF(:idem,'')::text
+                CAST(NULLIF(:idem, '') AS text)
             WHERE
-                -- si pas d'idem, on insère
                 (:idem IS NULL OR :idem = '')
-                -- sinon, on n'insère que si l'idem n'existe pas déjà
                 OR NOT EXISTS (
-                    SELECT 1 FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text
+                    SELECT 1
+                      FROM reports
+                     WHERE idempotency_key = CAST(NULLIF(:idem, '') AS text)
                 )
             RETURNING id
         """)
+
         params = {
-            "kind":   kind,
-            "signal": signal,
+            "kind":   kind,            # ✅ important : présent dans params
+            "signal": signal,          # ✅ important : présent dans params
             "lng":    float(p.lng),
             "lat":    float(p.lat),
-            "uid":    (uid or ""),     # "" -> NULL via NULLIF, puis CAST uuid OK
+            "uid":    (uid or ""),     # "" -> NULL via NULLIF, CAST uuid OK
             "idem":   idem             # peut être None
         }
+
         res = await db.execute(sql, params)
         row = res.first()
         await db.commit()
@@ -323,7 +325,7 @@ async def post_report(
         # Si pas de row (doublon idem), récupérer l'id existant
         if not row and (idem or ""):
             res2 = await db.execute(text("""
-                SELECT id FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text
+                SELECT id FROM reports WHERE idempotency_key = CAST(NULLIF(:idem,'') AS text)
             """), {"idem": idem})
             row = res2.first()
 
@@ -355,7 +357,8 @@ async def post_report(
                 WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                 SELECT 1
                   FROM reports r
-                 WHERE r.kind=:kind AND lower(trim(r.signal))='cut'
+                 WHERE r.kind = CAST(:kind AS text)
+                   AND lower(trim(r.signal::text)) = 'cut'
                    AND r.user_id = CAST(:uid AS uuid)
                    AND r.created_at >= NOW() - INTERVAL '24 hours'
                    AND ST_DWithin(r.geom, (SELECT g FROM me), :ownr)
@@ -369,13 +372,14 @@ async def post_report(
             WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
             UPDATE {target} i
                SET restored_at = COALESCE(i.restored_at, NOW())
-             WHERE i.kind = :kind
+             WHERE i.kind = CAST(:kind AS text)
                AND i.restored_at IS NULL
                AND ST_DWithin(i.center, (SELECT g FROM me), 150)
         """), {"kind": kind, "lng": p.lng, "lat": p.lat})
         await db.commit()
 
     return {"ok": True, "id": report_id, "idempotency_key": idem}
+
 
 
 # --------- Upload image ----------
