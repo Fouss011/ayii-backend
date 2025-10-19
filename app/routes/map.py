@@ -53,21 +53,43 @@ async def options_report():
     return Response(status_code=204)
 
 # --------- Upload vers Supabase Storage ----------
+# --------- Upload vers Supabase Storage ----------
 async def _upload_to_supabase(file_bytes: bytes, filename: str, content_type: str) -> str:
-    if not (SUPABASE_URL and SUPABASE_KEY):
-        raise HTTPException(status_code=500, detail="supabase creds missing")
-    import httpx, time
-    path = f"{int(time.time())}/{uuid.uuid4()}-{filename}"
-    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
+    SUPA_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    SUPA_KEY = os.getenv("SUPABASE_SERVICE_ROLE", "")
+    BUCKET   = os.getenv("SUPABASE_BUCKET", "attachments")
+
+    if not (SUPA_URL and SUPA_KEY and BUCKET):
+        raise HTTPException(status_code=500, detail="supabase creds missing (SUPABASE_URL / SUPABASE_SERVICE_ROLE / SUPABASE_BUCKET)")
+
+    import httpx, time, uuid as _uuid
+
+    path = f"{int(time.time())}/{_uuid.uuid4()}-{(filename or 'photo.jpg')}"
+    upload_url = f"{SUPA_URL}/storage/v1/object/{BUCKET}/{path}"
     headers = {
-        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Authorization": f"Bearer {SUPA_KEY}",
         "Content-Type": content_type or "application/octet-stream",
+        # upsert facultatif, mais utile si même nom (ici on met toujours un uuid donc pas critique)
+        "x-upsert": "true",
     }
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(upload_url, headers=headers, content=file_bytes)
-        if r.status_code not in (200, 201):
-            raise HTTPException(status_code=500, detail=f"supabase upload failed: {r.text}")
-    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(upload_url, headers=headers, content=file_bytes)
+    except httpx.ConnectError as e:
+        raise HTTPException(502, detail=f"supabase connect error: {e}")
+    except httpx.ReadTimeout as e:
+        raise HTTPException(504, detail=f"supabase timeout: {e}")
+    except Exception as e:
+        raise HTTPException(500, detail=f"supabase http error: {e}")
+
+    if r.status_code not in (200, 201):
+        # renvoyer le corps d'erreur Supabase pour debug
+        raise HTTPException(status_code=500, detail=f"supabase upload failed [{r.status_code}]: {r.text}")
+
+    # URL publique (bucket doit être Public)
+    return f"{SUPA_URL}/storage/v1/object/public/{BUCKET}/{path}"
+
 
 # --------- Lecture incidents / outages avec compteur d’images ----------
 # --------- Helpers lecture ----------
@@ -430,31 +452,50 @@ async def upload_image(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
-    k = (kind or "").lower().strip()
-    if k not in {"traffic","accident","fire","flood","power","water"}:
-        raise HTTPException(400, "invalid kind")
-    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-        raise HTTPException(400, "invalid coordinates")
+    try:
+        k = (kind or "").lower().strip()
+        if k not in {"traffic","accident","fire","flood","power","water"}:
+            raise HTTPException(400, "invalid kind")
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            raise HTTPException(400, "invalid coordinates")
 
-    ct = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
-    if not ct.startswith("image/"):
-        raise HTTPException(400, "only image/* allowed")
-    content = await file.read()
-    if len(content) > 5 * 1024 * 1024:
-        raise HTTPException(413, "file too large (max 5MB)")
+        import mimetypes
+        ct = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+        if not ct.startswith("image/"):
+            raise HTTPException(400, "only image/* allowed")
 
-    url = await _upload_to_supabase(content, file.filename or "photo.jpg", ct)
+        content = await file.read()
+        if len(content) > 5 * 1024 * 1024:
+            raise HTTPException(413, "file too large (max 5MB)")
 
-    uid = _to_uuid_or_none(user_id)
+        url = await _upload_to_supabase(content, file.filename or "photo.jpg", ct)
 
-    await db.execute(text("""
-        INSERT INTO attachments(kind, url, geom, user_id, idempotency_key, created_at)
-        VALUES (:kind, :url, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography, CAST(NULLIF(:uid,'') AS uuid), :idem, NOW())
-        ON CONFLICT (idempotency_key, url) DO NOTHING
-    """), {"kind": k, "url": url, "lng": lng, "lat": lat, "uid": (uid or ""), "idem": idempotency_key})
-    await db.commit()
+        uid = _to_uuid_or_none(user_id)
 
-    return {"ok": True, "url": url}
+        await db.execute(text("""
+            INSERT INTO attachments(kind, url, geom, user_id, idempotency_key, created_at)
+            VALUES (:kind, :url, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography, CAST(NULLIF(:uid,'') AS uuid), :idem, NOW())
+            ON CONFLICT (idempotency_key, url) DO NOTHING
+        """), {"kind": k, "url": url, "lng": lng, "lat": lat, "uid": (uid or ""), "idem": idempotency_key})
+        await db.commit()
+
+        return {"ok": True, "url": url}
+
+    except HTTPException:
+        # on propage tel quel (JSON)
+        raise
+    except Exception as e:
+        # attraper toute autre erreur et renvoyer JSON
+        raise HTTPException(500, detail=f"upload_image failed: {e}")
+
+@router.get("/admin/supabase_status")
+async def supabase_status():
+    return {
+        "SUPABASE_URL_set": bool(os.getenv("SUPABASE_URL")),
+        "SUPABASE_SERVICE_ROLE_set": bool(os.getenv("SUPABASE_SERVICE_ROLE")),
+        "SUPABASE_BUCKET": os.getenv("SUPABASE_BUCKET", "attachments"),
+    }
+
 
 # --------- RESET USER ----------
 @router.post("/reset_user")
