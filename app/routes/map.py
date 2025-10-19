@@ -288,13 +288,13 @@ async def post_report(
         except Exception:
             await db.rollback()
 
-    # --- INSERT report (idempotent) -> utilise CAST() (pas ::) et passe TOUS les params ---
+    # --- INSERT report (idempotent) : CASTER vers ENUMs + typage sûr ---
     try:
         sql = text("""
             INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
             SELECT
-                CAST(:kind   AS text),
-                CAST(:signal AS text),
+                CAST(:kind   AS report_kind),
+                CAST(:signal AS report_signal),
                 ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
                 CAST(NULLIF(:uid, '') AS uuid),
                 NOW(),
@@ -310,12 +310,12 @@ async def post_report(
         """)
 
         params = {
-            "kind":   kind,            # ✅ important : présent dans params
-            "signal": signal,          # ✅ important : présent dans params
+            "kind":   kind,
+            "signal": signal,
             "lng":    float(p.lng),
             "lat":    float(p.lat),
             "uid":    (uid or ""),     # "" -> NULL via NULLIF, CAST uuid OK
-            "idem":   idem             # peut être None
+            "idem":   idem
         }
 
         res = await db.execute(sql, params)
@@ -335,16 +335,16 @@ async def post_report(
         await db.rollback()
         raise HTTPException(500, f"report insert failed: {e}")
 
-    # --- Maintien des tables évènementielles (incidents/outages) ---
+    # --- Maintien des tables évènementielles ---
     if signal == "cut":
         target = "outages" if kind in ("power","water") else "incidents"
         await db.execute(text(f"""
             WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
             INSERT INTO {target}(kind, center, started_at, restored_at)
-            SELECT :kind, (SELECT g FROM me), NOW(), NULL
+            SELECT CAST(:kind AS report_kind), (SELECT g FROM me), NOW(), NULL
             WHERE NOT EXISTS (
               SELECT 1 FROM {target} i
-               WHERE i.kind = :kind
+               WHERE i.kind = CAST(:kind AS report_kind)
                  AND i.restored_at IS NULL
                  AND ST_DWithin(i.center, (SELECT g FROM me), 120)
             )
@@ -357,7 +357,7 @@ async def post_report(
                 WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                 SELECT 1
                   FROM reports r
-                 WHERE r.kind = CAST(:kind AS text)
+                 WHERE r.kind = CAST(:kind AS report_kind)
                    AND lower(trim(r.signal::text)) = 'cut'
                    AND r.user_id = CAST(:uid AS uuid)
                    AND r.created_at >= NOW() - INTERVAL '24 hours'
@@ -372,13 +372,14 @@ async def post_report(
             WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
             UPDATE {target} i
                SET restored_at = COALESCE(i.restored_at, NOW())
-             WHERE i.kind = CAST(:kind AS text)
+             WHERE i.kind = CAST(:kind AS report_kind)
                AND i.restored_at IS NULL
                AND ST_DWithin(i.center, (SELECT g FROM me), 150)
         """), {"kind": kind, "lng": p.lng, "lat": p.lat})
         await db.commit()
 
     return {"ok": True, "id": report_id, "idempotency_key": idem}
+
 
 
 
