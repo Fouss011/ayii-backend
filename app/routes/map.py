@@ -214,17 +214,18 @@ async def map_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        # 0) Auto-clôture > AUTO_EXPIRE_H (incidents + outages)
+                # 0) Auto-clôture > AUTO_EXPIRE_H (incidents + outages) -- respect du flag
         try:
-            await db.execute(text(f"""
-                UPDATE incidents SET restored_at = COALESCE(restored_at, NOW())
-                WHERE restored_at IS NULL AND started_at < NOW() - INTERVAL '{AUTO_EXPIRE_H} hours'
-            """))
-            await db.execute(text(f"""
-                UPDATE outages SET restored_at = COALESCE(restored_at, NOW())
-                WHERE restored_at IS NULL AND started_at < NOW() - INTERVAL '{AUTO_EXPIRE_H} hours'
-            """))
-            await db.commit()
+            if os.getenv("AUTO_EXPIRE_ENABLED", "1") != "0":
+                await db.execute(text(f"""
+                    UPDATE incidents SET restored_at = COALESCE(restored_at, NOW())
+                    WHERE restored_at IS NULL AND started_at < NOW() - INTERVAL '{AUTO_EXPIRE_H} hours'
+                """))
+                await db.execute(text(f"""
+                    UPDATE outages SET restored_at = COALESCE(restored_at, NOW())
+                    WHERE restored_at IS NULL AND started_at < NOW() - INTERVAL '{AUTO_EXPIRE_H} hours'
+                """))
+                await db.commit()
         except Exception:
             await db.rollback()  # on ne bloque pas /map si ça échoue
 
