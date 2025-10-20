@@ -1,15 +1,18 @@
-# app/routes/report.py
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.db import get_db
-from app.schemas import ReportIn
-from app.crud import insert_report
-
-router = APIRouter()
+import json
+from typing import Any
+from fastapi import Body
 
 @router.post("/report")
-async def create_report(payload: ReportIn, db: AsyncSession = Depends(get_db)):
+async def create_report(payload: Any = Body(...), db: AsyncSession = Depends(get_db)):
     try:
+        # 🔧 Accepter les corps "stringifiés"
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=422, detail="Invalid JSON string")
+        payload = ReportIn.model_validate(payload)  # re-valider proprement
+
         rid = await insert_report(
             db,
             kind=payload.kind.value if hasattr(payload.kind, "value") else str(payload.kind),
