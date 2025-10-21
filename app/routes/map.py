@@ -1,5 +1,5 @@
 # app/routes/map.py
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request, Header, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request, Header, UploadFile, File, Form, Body
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -289,9 +289,9 @@ class ReportIn(BaseModel):
 
 @router.post("/report")
 async def post_report(
-    body: Any,
+    p: ReportIn = Body(...),
     db: AsyncSession = Depends(get_db),
-    x_admin_token: Optional[str] = Header(default=None)
+    x_admin_token: Optional[str] = Header(default=None),
 ):
     # 🔧 Normalisation d'entrée (string/bytes/dict -> dict)
     if isinstance(body, (str, bytes)):
