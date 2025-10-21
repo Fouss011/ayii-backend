@@ -92,10 +92,8 @@ async def _upload_to_supabase(file_bytes: bytes, filename: str, content_type: st
     return f"{SUPA_URL}/storage/v1/object/public/{BUCKET}/{path}"
 
 
-# --------- Lecture incidents / outages avec compteur d’images ----------
 # --------- Helpers lecture ----------
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
-    # Version avec compteur d'attachments, robuste aux différences de type (text vs enum)
     q_full = text("""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
         SELECT o.id,
@@ -103,7 +101,16 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
                CASE WHEN o.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
                ST_Y(o.center::geometry) AS lat, ST_X(o.center::geometry) AS lng,
                o.started_at, o.restored_at,
-               COALESCE(att.cnt, 0)::int AS attachments_count
+               COALESCE(att.cnt, 0)::int AS attachments_count,
+               (
+                 SELECT r.user_id
+                   FROM reports r
+                  WHERE r.kind = o.kind
+                    AND lower(trim(r.signal::text))='cut'
+                    AND ST_DWithin(r.geom, o.center, 150)
+                  ORDER BY r.created_at DESC
+                  LIMIT 1
+               ) AS owner_user_id
         FROM outages o
         LEFT JOIN LATERAL (
           SELECT COUNT(*)::int AS cnt
@@ -115,7 +122,6 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
         WHERE ST_DWithin(o.center, (SELECT g FROM me), :r)
         ORDER BY o.started_at DESC NULLS LAST, o.id DESC
     """)
-    # Fallback si la table attachments n’existe pas
     q_min = text("""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
         SELECT o.id,
@@ -123,22 +129,25 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
                CASE WHEN o.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
                ST_Y(o.center::geometry) AS lat, ST_X(o.center::geometry) AS lng,
                o.started_at, o.restored_at,
-               0::int AS attachments_count
+               0::int AS attachments_count,
+               (
+                 SELECT r.user_id
+                   FROM reports r
+                  WHERE r.kind = o.kind
+                    AND lower(trim(r.signal::text))='cut'
+                    AND ST_DWithin(r.geom, o.center, 150)
+                  ORDER BY r.created_at DESC
+                  LIMIT 1
+               ) AS owner_user_id
         FROM outages o
         WHERE ST_DWithin(o.center, (SELECT g FROM me), :r)
         ORDER BY o.started_at DESC NULLS LAST, o.id DESC
     """)
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
-    except Exception as e:
-        # Si la table/colonne n’existe pas encore, on fallback
-        msg = str(e)
-        if "relation \"attachments\" does not exist" in msg.lower() or "UndefinedTable" in msg or "does not exist" in msg:
-            await db.rollback()
-            res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
-        else:
-            await db.rollback()
-            raise
+    except Exception:
+        await db.rollback()
+        res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
     rows = res.fetchall()
     return [
         {
@@ -146,7 +155,8 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
             "lat": float(r.lat), "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
-            "attachments_count": getattr(r, "attachments_count", 0)
+            "attachments_count": getattr(r, "attachments_count", 0),
+            "owner_user_id": getattr(r, "owner_user_id", None),
         } for r in rows
     ]
 
@@ -159,7 +169,16 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
                CASE WHEN i.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
                ST_Y(i.center::geometry) AS lat, ST_X(i.center::geometry) AS lng,
                i.started_at, i.restored_at,
-               COALESCE(att.cnt, 0)::int AS attachments_count
+               COALESCE(att.cnt, 0)::int AS attachments_count,
+               (
+                 SELECT r.user_id
+                   FROM reports r
+                  WHERE r.kind = i.kind
+                    AND lower(trim(r.signal::text))='cut'
+                    AND ST_DWithin(r.geom, i.center, 150)
+                  ORDER BY r.created_at DESC
+                  LIMIT 1
+               ) AS owner_user_id
         FROM incidents i
         LEFT JOIN LATERAL (
           SELECT COUNT(*)::int AS cnt
@@ -178,21 +197,25 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
                CASE WHEN i.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
                ST_Y(i.center::geometry) AS lat, ST_X(i.center::geometry) AS lng,
                i.started_at, i.restored_at,
-               0::int AS attachments_count
+               0::int AS attachments_count,
+               (
+                 SELECT r.user_id
+                   FROM reports r
+                  WHERE r.kind = i.kind
+                    AND lower(trim(r.signal::text))='cut'
+                    AND ST_DWithin(r.geom, i.center, 150)
+                  ORDER BY r.created_at DESC
+                  LIMIT 1
+               ) AS owner_user_id
         FROM incidents i
         WHERE ST_DWithin(i.center, (SELECT g FROM me), :r)
         ORDER BY i.started_at DESC NULLS LAST, i.id DESC
     """)
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
-    except Exception as e:
-        msg = str(e)
-        if "relation \"attachments\" does not exist" in msg.lower() or "UndefinedTable" in msg or "does not exist" in msg:
-            await db.rollback()
-            res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
-        else:
-            await db.rollback()
-            raise
+    except Exception:
+        await db.rollback()
+        res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
     rows = res.fetchall()
     return [
         {
@@ -200,9 +223,11 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
             "lat": float(r.lat), "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
-            "attachments_count": getattr(r, "attachments_count", 0)
+            "attachments_count": getattr(r, "attachments_count", 0),
+            "owner_user_id": getattr(r, "owner_user_id", None),
         } for r in rows
     ]
+
 
 
 # --------- GET /map ----------
