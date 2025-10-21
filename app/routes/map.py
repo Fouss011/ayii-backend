@@ -280,6 +280,16 @@ from typing import Any
 import json
 
 # --------- POST /report ----------
+# app/routes/map.py (remplacement intégral de la classe + endpoint)
+
+from fastapi import APIRouter, Depends, HTTPException, Header, Body
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from typing import Optional
+from app.db import get_db
+import uuid
+
 class ReportIn(BaseModel):
     kind: str            # "power" | "water" | "traffic" | "accident" | "fire" | "flood"
     signal: str          # "cut" | "restored"
@@ -288,9 +298,17 @@ class ReportIn(BaseModel):
     user_id: Optional[str] = None
     idempotency_key: Optional[str] = None
 
+def _to_uuid_or_none(val: Optional[str]):
+    try:
+        if not val:
+            return None
+        return str(uuid.UUID(str(val)))
+    except Exception:
+        return None
+
 @router.post("/report")
 async def post_report(
-    p: ReportIn,
+    p: ReportIn = Body(...),                 # 👈 force FastAPI à parser le JSON en objet
     db: AsyncSession = Depends(get_db),
     x_admin_token: Optional[str] = Header(default=None),
 ):
@@ -302,10 +320,11 @@ async def post_report(
         raise HTTPException(400, "invalid signal")
 
     uid = _to_uuid_or_none(p.user_id)
-    is_admin = (x_admin_token or "").strip() == ADMIN_TOKEN
     idem = (p.idempotency_key or "").strip() or None
+    # si tu veux l’ownership, garde ta logique ADMIN_TOKEN ici
+    is_admin = False
 
-    # Upsert user pour éviter FK cassée (si user_id fourni)
+    # Upsert utilisateur si fourni (évite la FK cassée)
     if uid:
         try:
             await db.execute(
@@ -316,8 +335,7 @@ async def post_report(
         except Exception:
             await db.rollback()
 
-    # 1) Enregistrer le report (idempotence via WHERE NOT EXISTS) + RETURNING id
-    #    On tente d'abord les CAST vers enums; si la BDD est en TEXT on fallback.
+    # 1) INSERT report (fallback si enums indisponibles)
     inserted_id = None
     try:
         res = await db.execute(text("""
@@ -326,51 +344,48 @@ async def post_report(
               CAST(:kind   AS report_kind),
               CAST(:signal AS report_signal),
               ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-              CAST(:uid AS uuid),
+              CAST(NULLIF(:uid,'') AS uuid),
               NOW(),
               NULLIF(:idem,'')::text
             WHERE
               (:idem IS NULL OR :idem = '')
               OR NOT EXISTS (
-                  SELECT 1 FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text
+                SELECT 1 FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text
               )
             RETURNING id
-        """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": uid, "idem": idem})
+        """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": (uid or ""), "idem": idem})
         row = res.fetchone()
         await db.commit()
         inserted_id = row[0] if row else None
-    except Exception as e1:
-        # Fallback TEXT si les enums n'existent pas
+    except Exception:
         await db.rollback()
-        try:
-            res = await db.execute(text("""
-                INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
-                SELECT
-                  CAST(:kind   AS text),
-                  CAST(:signal AS text),
-                  ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                  CAST(:uid AS uuid),
-                  NOW(),
-                  NULLIF(:idem,'')::text
-                WHERE
-                  (:idem IS NULL OR :idem = '')
-                  OR NOT EXISTS (
-                      SELECT 1 FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text
-                  )
-                RETURNING id
-            """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": uid, "idem": idem})
-            row = res.fetchone()
-            await db.commit()
-            inserted_id = row[0] if row else None
-        except Exception as e2:
-            await db.rollback()
-            raise HTTPException(500, f"report insert failed: {e2}")
+        # fallback TEXT
+        res = await db.execute(text("""
+            INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
+            SELECT
+              CAST(:kind   AS text),
+              CAST(:signal AS text),
+              ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+              CAST(NULLIF(:uid,'') AS uuid),
+              NOW(),
+              NULLIF(:idem,'')::text
+            WHERE
+              (:idem IS NULL OR :idem = '')
+              OR NOT EXISTS (
+                SELECT 1 FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text
+              )
+            RETURNING id
+        """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": (uid or ""), "idem": idem})
+        row = res.fetchone()
+        await db.commit()
+        inserted_id = row[0] if row else None
 
-    # 2) Maintenir INCIDENTS / OUTAGES (vérité carte)
+    # 2) Maintien incidents/outages
     try:
         if signal == "cut":
-            if kind in ("power","water"):
-                # OUTAGES: table avec enum outage_kind
+            table = "outages" if kind in ("power","water") else "incidents"
+            # outages peut être enum, incidents est TEXT → on CAST(:kind AS text) et on essaie enum côté outages
+            if table == "outages":
                 try:
                     await db.execute(text("""
                         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
@@ -384,7 +399,6 @@ async def post_report(
                         )
                     """), {"kind": kind, "lng": p.lng, "lat": p.lat})
                 except Exception:
-                    # Fallback si colonne TEXT
                     await db.execute(text("""
                         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                         INSERT INTO outages(kind, center, started_at, restored_at)
@@ -396,9 +410,7 @@ async def post_report(
                              AND ST_DWithin(i.center, (SELECT g FROM me), 120)
                         )
                     """), {"kind": kind, "lng": p.lng, "lat": p.lat})
-                await db.commit()
             else:
-                # INCIDENTS: kind TEXT
                 await db.execute(text("""
                     WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                     INSERT INTO incidents(kind, center, started_at, restored_at)
@@ -410,9 +422,8 @@ async def post_report(
                          AND ST_DWithin(i.center, (SELECT g FROM me), 120)
                     )
                 """), {"kind": kind, "lng": p.lng, "lat": p.lat})
-                await db.commit()
+            await db.commit()
         else:
-            # RESTORED : Ownership (hors admin)
             if not is_admin and uid:
                 q = await db.execute(text("""
                     WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
@@ -421,14 +432,14 @@ async def post_report(
                      WHERE r.kind=:kind AND lower(trim(r.signal::text))='cut'
                        AND r.user_id = CAST(:uid AS uuid)
                        AND r.created_at >= NOW() - INTERVAL '24 hours'
-                       AND ST_DWithin(r.geom, (SELECT g FROM me), :ownr)
+                       AND ST_DWithin(r.geom, (SELECT g FROM me), 150)
                      LIMIT 1
-                """), {"kind": kind, "uid": uid, "lng": p.lng, "lat": p.lat, "ownr": OWNERSHIP_RADIUS_M})
+                """), {"kind": kind, "uid": uid, "lng": p.lng, "lat": p.lat})
                 if q.first() is None:
                     raise HTTPException(403, "not_owner")
 
-            if kind in ("power","water"):
-                # OUTAGES: enum outage_kind (fallback TEXT)
+            table = "outages" if kind in ("power","water") else "incidents"
+            if table == "outages":
                 try:
                     await db.execute(text("""
                         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
@@ -447,9 +458,7 @@ async def post_report(
                            AND i.restored_at IS NULL
                            AND ST_DWithin(i.center, (SELECT g FROM me), 150)
                     """), {"kind": kind, "lng": p.lng, "lat": p.lat})
-                await db.commit()
             else:
-                # INCIDENTS: kind TEXT
                 await db.execute(text("""
                     WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                     UPDATE incidents i
@@ -458,15 +467,15 @@ async def post_report(
                        AND i.restored_at IS NULL
                        AND ST_DWithin(i.center, (SELECT g FROM me), 150)
                 """), {"kind": kind, "lng": p.lng, "lat": p.lat})
-                await db.commit()
+            await db.commit()
     except HTTPException:
-        # On propage les 403 not_owner etc.
         raise
     except Exception as e:
         await db.rollback()
         raise HTTPException(500, f"events update failed: {e}")
 
     return {"ok": True, "id": inserted_id, "idempotency_key": idem}
+
 
 
 
