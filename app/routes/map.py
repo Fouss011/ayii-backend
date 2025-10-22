@@ -534,6 +534,43 @@ async def post_report(
 
     return {"ok": True, "id": inserted_id, "idempotency_key": idem}
 
+@router.post("/admin/factory_reset")
+async def admin_factory_reset(request: Request, db: AsyncSession = Depends(get_db)):
+    _check_admin_token(request)  # nécessite x-admin-token
+    try:
+        # 1) tout vider (TRUNCATE + RESTART IDENTITY)
+        # NB: attachments n'existait pas dans ton wipe_all initial → on l'ajoute ici
+        for ddl in [
+            "TRUNCATE TABLE reports RESTART IDENTITY CASCADE",
+            "TRUNCATE TABLE incidents RESTART IDENTITY CASCADE",
+            "TRUNCATE TABLE outages RESTART IDENTITY CASCADE",
+            "TRUNCATE TABLE attachments RESTART IDENTITY CASCADE"
+        ]:
+            try:
+                await db.execute(text(ddl))
+            except Exception:
+                # si la table n'existe pas encore, on ignore
+                await db.rollback()
+
+        await db.commit()
+
+        # 2) ré-assurer le schéma minimal utile aux requêtes
+        try:
+            await db.execute(text("ALTER TABLE incidents ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
+            await db.execute(text("ALTER TABLE outages   ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
+            await db.execute(text("CREATE INDEX IF NOT EXISTS idx_incidents_center ON incidents USING GIST ((center::geometry))"))
+            await db.execute(text("CREATE INDEX IF NOT EXISTS idx_outages_center   ON outages   USING GIST ((center::geometry))"))
+            await db.execute(text("CREATE INDEX IF NOT EXISTS idx_incidents_kind ON incidents(kind)"))
+            await db.execute(text("CREATE INDEX IF NOT EXISTS idx_outages_kind   ON outages(kind)"))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            # ne bloque pas le reset si ensure_schema a un souci
+
+        return {"ok": True}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"factory_reset failed: {e}")
 
 
 
