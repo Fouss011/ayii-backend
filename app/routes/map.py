@@ -92,145 +92,148 @@ async def _upload_to_supabase(file_bytes: bytes, filename: str, content_type: st
     return f"{SUPA_URL}/storage/v1/object/public/{BUCKET}/{path}"
 
 
-# --------- Helpers lecture ----------
+# ---------- LECTURES SÛRES (outages/incidents) ----------
+
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
+    """
+    Lit les outages autour d'un point, en étant tolérant:
+    - cast kind en ::text (enum vs text)
+    - cast center/geom en ::geography pour ST_DWithin
+    - attachments en LEFT JOIN LATERAL si la table existe, sinon fallback sans compteur
+    """
     q_full = text("""
-        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+        )
         SELECT o.id,
                o.kind::text AS kind,
                CASE WHEN o.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-               ST_Y(o.center::geometry) AS lat, ST_X(o.center::geometry) AS lng,
-               o.started_at, o.restored_at,
-               COALESCE(att.cnt, 0)::int AS attachments_count,
-               (
-                 SELECT r.user_id
-                   FROM reports r
-                  WHERE r.kind = o.kind
-                    AND lower(trim(r.signal::text))='cut'
-                    AND ST_DWithin(r.geom, o.center, 150)
-                  ORDER BY r.created_at DESC
-                  LIMIT 1
-               ) AS owner_user_id
+               ST_Y((o.center::geometry)) AS lat,
+               ST_X((o.center::geometry)) AS lng,
+               o.started_at,
+               o.restored_at,
+               COALESCE(att.cnt, 0)::int AS attachments_count
         FROM outages o
         LEFT JOIN LATERAL (
           SELECT COUNT(*)::int AS cnt
             FROM attachments a
            WHERE a.kind::text = o.kind::text
              AND a.created_at > NOW() - INTERVAL '48 hours'
-             AND ST_DWithin((a.geom)::geography, o.center, 120)
+             AND ST_DWithin((a.geom::geography), (o.center::geography), 120)
         ) att ON TRUE
-        WHERE ST_DWithin(o.center, (SELECT g FROM me), :r)
+        WHERE ST_DWithin((o.center::geography), (SELECT g FROM me), :r)
         ORDER BY o.started_at DESC NULLS LAST, o.id DESC
     """)
+
     q_min = text("""
-        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+        )
         SELECT o.id,
                o.kind::text AS kind,
                CASE WHEN o.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-               ST_Y(o.center::geometry) AS lat, ST_X(o.center::geometry) AS lng,
-               o.started_at, o.restored_at,
-               0::int AS attachments_count,
-               (
-                 SELECT r.user_id
-                   FROM reports r
-                  WHERE r.kind = o.kind
-                    AND lower(trim(r.signal::text))='cut'
-                    AND ST_DWithin(r.geom, o.center, 150)
-                  ORDER BY r.created_at DESC
-                  LIMIT 1
-               ) AS owner_user_id
+               ST_Y((o.center::geometry)) AS lat,
+               ST_X((o.center::geometry)) AS lng,
+               o.started_at,
+               o.restored_at,
+               0::int AS attachments_count
         FROM outages o
-        WHERE ST_DWithin(o.center, (SELECT g FROM me), :r)
+        WHERE ST_DWithin((o.center::geography), (SELECT g FROM me), :r)
         ORDER BY o.started_at DESC NULLS LAST, o.id DESC
     """)
+
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
-    except Exception:
+    except Exception as e:
+        # Table attachments absente / colonne absente → fallback
         await db.rollback()
         res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
+
     rows = res.fetchall()
     return [
         {
-            "id": r.id, "kind": r.kind, "status": r.status,
-            "lat": float(r.lat), "lng": float(r.lng),
+            "id": r.id,
+            "kind": r.kind,
+            "status": r.status,
+            "lat": float(r.lat),
+            "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
             "attachments_count": getattr(r, "attachments_count", 0),
-            "owner_user_id": getattr(r, "owner_user_id", None),
-        } for r in rows
+        }
+        for r in rows
     ]
 
 
 async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
+    """
+    Même approche que fetch_outages, mais pour incidents (kind text).
+    """
     q_full = text("""
-        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+        )
         SELECT i.id,
                i.kind::text AS kind,
                CASE WHEN i.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-               ST_Y(i.center::geometry) AS lat, ST_X(i.center::geometry) AS lng,
-               i.started_at, i.restored_at,
-               COALESCE(att.cnt, 0)::int AS attachments_count,
-               (
-                 SELECT r.user_id
-                   FROM reports r
-                  WHERE r.kind = i.kind
-                    AND lower(trim(r.signal::text))='cut'
-                    AND ST_DWithin(r.geom, i.center, 150)
-                  ORDER BY r.created_at DESC
-                  LIMIT 1
-               ) AS owner_user_id
+               ST_Y((i.center::geometry)) AS lat,
+               ST_X((i.center::geometry)) AS lng,
+               i.started_at,
+               i.restored_at,
+               COALESCE(att.cnt, 0)::int AS attachments_count
         FROM incidents i
         LEFT JOIN LATERAL (
           SELECT COUNT(*)::int AS cnt
             FROM attachments a
            WHERE a.kind::text = i.kind::text
              AND a.created_at > NOW() - INTERVAL '48 hours'
-             AND ST_DWithin((a.geom)::geography, i.center, 120)
+             AND ST_DWithin((a.geom::geography), (i.center::geography), 120)
         ) att ON TRUE
-        WHERE ST_DWithin(i.center, (SELECT g FROM me), :r)
+        WHERE ST_DWithin((i.center::geography), (SELECT g FROM me), :r)
         ORDER BY i.started_at DESC NULLS LAST, i.id DESC
     """)
+
     q_min = text("""
-        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+        )
         SELECT i.id,
                i.kind::text AS kind,
                CASE WHEN i.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
-               ST_Y(i.center::geometry) AS lat, ST_X(i.center::geometry) AS lng,
-               i.started_at, i.restored_at,
-               0::int AS attachments_count,
-               (
-                 SELECT r.user_id
-                   FROM reports r
-                  WHERE r.kind = i.kind
-                    AND lower(trim(r.signal::text))='cut'
-                    AND ST_DWithin(r.geom, i.center, 150)
-                  ORDER BY r.created_at DESC
-                  LIMIT 1
-               ) AS owner_user_id
+               ST_Y((i.center::geometry)) AS lat,
+               ST_X((i.center::geometry)) AS lng,
+               i.started_at,
+               i.restored_at,
+               0::int AS attachments_count
         FROM incidents i
-        WHERE ST_DWithin(i.center, (SELECT g FROM me), :r)
+        WHERE ST_DWithin((i.center::geography), (SELECT g FROM me), :r)
         ORDER BY i.started_at DESC NULLS LAST, i.id DESC
     """)
+
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
     except Exception:
         await db.rollback()
         res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
+
     rows = res.fetchall()
     return [
         {
-            "id": r.id, "kind": r.kind, "status": r.status,
-            "lat": float(r.lat), "lng": float(r.lng),
+            "id": r.id,
+            "kind": r.kind,
+            "status": r.status,
+            "lat": float(r.lat),
+            "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
             "attachments_count": getattr(r, "attachments_count", 0),
-            "owner_user_id": getattr(r, "owner_user_id", None),
-        } for r in rows
+        }
+        for r in rows
     ]
 
 
+# ---------- ENDPOINT /map ROBUSTE ----------
 
-# --------- GET /map ----------
 @router.get("/map")
 async def map_endpoint(
     lat: float = Query(..., ge=-90, le=90),
@@ -239,53 +242,75 @@ async def map_endpoint(
     response: Response = None,
     db: AsyncSession = Depends(get_db),
 ):
+    from datetime import datetime, timezone
+
+    def nowz():
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
     try:
-                # 0) Auto-clôture > AUTO_EXPIRE_H (incidents + outages) -- respect du flag
+        # 0) Auto-clôture respectant le flag
         try:
             if os.getenv("AUTO_EXPIRE_ENABLED", "1") != "0":
                 await db.execute(text(f"""
-                    UPDATE incidents SET restored_at = COALESCE(restored_at, NOW())
-                    WHERE restored_at IS NULL AND started_at < NOW() - INTERVAL '{AUTO_EXPIRE_H} hours'
+                    UPDATE incidents
+                       SET restored_at = COALESCE(restored_at, NOW())
+                     WHERE restored_at IS NULL
+                       AND started_at  < NOW() - INTERVAL '{AUTO_EXPIRE_H} hours'
                 """))
                 await db.execute(text(f"""
-                    UPDATE outages SET restored_at = COALESCE(restored_at, NOW())
-                    WHERE restored_at IS NULL AND started_at < NOW() - INTERVAL '{AUTO_EXPIRE_H} hours'
+                    UPDATE outages
+                       SET restored_at = COALESCE(restored_at, NOW())
+                     WHERE restored_at IS NULL
+                       AND started_at  < NOW() - INTERVAL '{AUTO_EXPIRE_H} hours'
                 """))
                 await db.commit()
         except Exception:
-            await db.rollback()  # on ne bloque pas /map si ça échoue
+            await db.rollback()  # ne bloque pas /map
 
         r_m = float(radius_km * 1000.0)
+
+        # 1) évènements
         outages   = await fetch_outages(db, lat, lng, r_m)
         incidents = await fetch_incidents(db, lat, lng, r_m)
 
-        # Derniers reports: SEULEMENT 'cut' récents
+        # 2) derniers reports (CUT récents), casts text + geography explicites
         q_rep = text(f"""
-            WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography AS g)
-            SELECT id, kind::text AS kind, signal::text AS signal,
-                   ST_Y(geom::geometry) AS lat, ST_X(geom::geometry) AS lng,
-                   user_id, created_at
-            FROM reports
-            WHERE ST_DWithin(geom::geography, (SELECT g FROM me), :r)
-              AND LOWER(TRIM(signal::text)) = 'cut'
-              AND created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
-            ORDER BY created_at DESC
-            LIMIT :max
+            WITH me AS (
+              SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+            )
+            SELECT id,
+                   kind::text   AS kind,
+                   signal::text AS signal,
+                   ST_Y((geom::geometry)) AS lat,
+                   ST_X((geom::geometry)) AS lng,
+                   user_id,
+                   created_at
+              FROM reports
+             WHERE ST_DWithin((geom::geography), (SELECT g FROM me), :r)
+               AND LOWER(TRIM(signal::text)) = 'cut'
+               AND created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
+             ORDER BY created_at DESC
+             LIMIT :max
         """)
         res_rep = await db.execute(q_rep, {"lng": lng, "lat": lat, "r": r_m, "max": MAX_REPORTS})
         last_reports = [
             {
-                "id": r.id, "kind": r.kind, "signal": r.signal,
-                "lat": float(r.lat), "lng": float(r.lng),
-                "user_id": r.user_id, "created_at": r.created_at,
-            } for r in res_rep.fetchall()
+                "id": r.id,
+                "kind": r.kind,
+                "signal": r.signal,
+                "lat": float(r.lat),
+                "lng": float(r.lng),
+                "user_id": r.user_id,
+                "created_at": r.created_at,
+            }
+            for r in res_rep.fetchall()
         ]
 
         payload = {
             "outages": outages,
             "incidents": incidents,
             "last_reports": last_reports,
-            "server_now": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            "server_now": nowz(),
         }
         if response is not None:
             response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
@@ -293,11 +318,19 @@ async def map_endpoint(
         return payload
 
     except Exception as e:
+        # ✅ FAILSAFE: pas de 500 — on renvoie un payload vide + message d’erreur
         try:
             await db.rollback()
         except Exception:
             pass
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "outages": [],
+            "incidents": [],
+            "last_reports": [],
+            "server_now": nowz(),
+            "error": f"{type(e).__name__}: {e}",
+        }
+
 
 # --------- POST /report ----------
 # --------- POST /report ----------
