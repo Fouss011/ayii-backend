@@ -3,19 +3,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request,
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-from typing import Optional
+from typing import Optional, Any, List
 from app.db import get_db
-import os, uuid, mimetypes
-
+import os, uuid, mimetypes, io, csv, json
+from datetime import datetime, timezone
 
 router = APIRouter()
-
-# Preflight CORS pour l’upload d’image
-@router.options("/upload_image")
-async def options_upload_image():
-    from fastapi import Response
-    return Response(status_code=204)
-
 
 # --------- Config ----------
 POINTS_WINDOW_MIN    = int(os.getenv("POINTS_WINDOW_MIN", "240"))
@@ -49,11 +42,28 @@ def _check_admin_token(request: Request):
         if tok != ADMIN_TOKEN:
             raise HTTPException(status_code=401, detail="Invalid admin token")
 
+def _now_isoz():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+# --------- Preflight CORS ----------
 @router.options("/report")
 async def options_report():
-    return Response(status_code=204)
+    resp = Response(status_code=204)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, x-admin-token"
+    resp.headers["Vary"] = "Origin"
+    return resp
 
-# --------- Upload vers Supabase Storage ----------
+@router.options("/upload_image")
+async def options_upload_image():
+    resp = Response(status_code=204)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, x-admin-token"
+    resp.headers["Vary"] = "Origin"
+    return resp
+
 # --------- Upload vers Supabase Storage ----------
 async def _upload_to_supabase(file_bytes: bytes, filename: str, content_type: str) -> str:
     SUPA_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
@@ -63,14 +73,12 @@ async def _upload_to_supabase(file_bytes: bytes, filename: str, content_type: st
     if not (SUPA_URL and SUPA_KEY and BUCKET):
         raise HTTPException(status_code=500, detail="supabase creds missing (SUPABASE_URL / SUPABASE_SERVICE_ROLE / SUPABASE_BUCKET)")
 
-    import httpx, time, uuid as _uuid
-
-    path = f"{int(time.time())}/{_uuid.uuid4()}-{(filename or 'photo.jpg')}"
+    import httpx, time as _time, uuid as _uuid
+    path = f"{int(_time.time())}/{_uuid.uuid4()}-{(filename or 'photo.jpg')}"
     upload_url = f"{SUPA_URL}/storage/v1/object/{BUCKET}/{path}"
     headers = {
         "Authorization": f"Bearer {SUPA_KEY}",
         "Content-Type": content_type or "application/octet-stream",
-        # upsert facultatif, mais utile si même nom (ici on met toujours un uuid donc pas critique)
         "x-upsert": "true",
     }
 
@@ -85,22 +93,12 @@ async def _upload_to_supabase(file_bytes: bytes, filename: str, content_type: st
         raise HTTPException(500, detail=f"supabase http error: {e}")
 
     if r.status_code not in (200, 201):
-        # renvoyer le corps d'erreur Supabase pour debug
         raise HTTPException(status_code=500, detail=f"supabase upload failed [{r.status_code}]: {r.text}")
 
-    # URL publique (bucket doit être Public)
     return f"{SUPA_URL}/storage/v1/object/public/{BUCKET}/{path}"
 
-
-# ---------- LECTURES SÛRES (outages/incidents) ----------
-
+# ---------- LECTURES (outages/incidents) ----------
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
-    """
-    Lit les outages autour d'un point, en étant tolérant:
-    - cast kind en ::text (enum vs text)
-    - cast center/geom en ::geography pour ST_DWithin
-    - attachments en LEFT JOIN LATERAL si la table existe, sinon fallback sans compteur
-    """
     q_full = text("""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
@@ -124,7 +122,6 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
         WHERE ST_DWithin((o.center::geography), (SELECT g FROM me), :r)
         ORDER BY o.started_at DESC NULLS LAST, o.id DESC
     """)
-
     q_min = text("""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
@@ -141,14 +138,11 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
         WHERE ST_DWithin((o.center::geography), (SELECT g FROM me), :r)
         ORDER BY o.started_at DESC NULLS LAST, o.id DESC
     """)
-
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
-    except Exception as e:
-        # Table attachments absente / colonne absente → fallback
+    except Exception:
         await db.rollback()
         res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
-
     rows = res.fetchall()
     return [
         {
@@ -164,11 +158,7 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
         for r in rows
     ]
 
-
 async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
-    """
-    Même approche que fetch_outages, mais pour incidents (kind text).
-    """
     q_full = text("""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
@@ -192,7 +182,6 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
         WHERE ST_DWithin((i.center::geography), (SELECT g FROM me), :r)
         ORDER BY i.started_at DESC NULLS LAST, i.id DESC
     """)
-
     q_min = text("""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
@@ -209,13 +198,11 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
         WHERE ST_DWithin((i.center::geography), (SELECT g FROM me), :r)
         ORDER BY i.started_at DESC NULLS LAST, i.id DESC
     """)
-
     try:
         res = await db.execute(q_full, {"lng": lng, "lat": lat, "r": r_m})
     except Exception:
         await db.rollback()
         res = await db.execute(q_min, {"lng": lng, "lat": lat, "r": r_m})
-
     rows = res.fetchall()
     return [
         {
@@ -231,9 +218,7 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
         for r in rows
     ]
 
-
-# ---------- ENDPOINT /map ROBUSTE ----------
-
+# ---------- ENDPOINT /map ----------
 @router.get("/map")
 async def map_endpoint(
     lat: float = Query(..., ge=-90, le=90),
@@ -242,13 +227,8 @@ async def map_endpoint(
     response: Response = None,
     db: AsyncSession = Depends(get_db),
 ):
-    from datetime import datetime, timezone
-
-    def nowz():
-        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
     try:
-        # 0) Auto-clôture respectant le flag
+        # 0) Auto-clôture incidents/outages anciens (si activé)
         try:
             if os.getenv("AUTO_EXPIRE_ENABLED", "1") != "0":
                 await db.execute(text(f"""
@@ -265,15 +245,13 @@ async def map_endpoint(
                 """))
                 await db.commit()
         except Exception:
-            await db.rollback()  # ne bloque pas /map
+            await db.rollback()
 
         r_m = float(radius_km * 1000.0)
 
-        # 1) évènements
         outages   = await fetch_outages(db, lat, lng, r_m)
         incidents = await fetch_incidents(db, lat, lng, r_m)
 
-        # 2) derniers reports (CUT récents), casts text + geography explicites
         q_rep = text(f"""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
@@ -310,7 +288,7 @@ async def map_endpoint(
             "outages": outages,
             "incidents": incidents,
             "last_reports": last_reports,
-            "server_now": nowz(),
+            "server_now": _now_isoz(),
         }
         if response is not None:
             response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
@@ -318,7 +296,6 @@ async def map_endpoint(
         return payload
 
     except Exception as e:
-        # ✅ FAILSAFE: pas de 500 — on renvoie un payload vide + message d’erreur
         try:
             await db.rollback()
         except Exception:
@@ -327,18 +304,11 @@ async def map_endpoint(
             "outages": [],
             "incidents": [],
             "last_reports": [],
-            "server_now": nowz(),
+            "server_now": _now_isoz(),
             "error": f"{type(e).__name__}: {e}",
         }
 
-
 # --------- POST /report ----------
-# --------- POST /report ----------
-from typing import Any
-# --------- POST /report ----------
-from pydantic import BaseModel
-from typing import Optional
-
 class ReportIn(BaseModel):
     kind: str            # "power" | "water" | "traffic" | "accident" | "fire" | "flood"
     signal: str          # "cut" | "restored"
@@ -353,6 +323,12 @@ async def post_report(
     db: AsyncSession = Depends(get_db),
     x_admin_token: Optional[str] = Header(default=None),
 ):
+    # Timeout SQL "local" pour éviter que la requête reste bloquée côté DB
+    try:
+        await db.execute(text("SET LOCAL statement_timeout = '8s'"))
+    except Exception:
+        await db.rollback()
+
     kind = (p.kind or "").lower().strip()
     signal = (p.signal or "").lower().strip()
     if kind not in {"power","water","traffic","accident","fire","flood"}:
@@ -375,10 +351,9 @@ async def post_report(
         except Exception:
             await db.rollback()
 
-    # 1) Enregistrer le report (idempotent) + RETURNING id
+    # 1) Enregistrer le report (idempotent)
     inserted_id = None
     try:
-        # Tentative avec enums report_kind/report_signal
         res = await db.execute(text("""
             INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
             SELECT
@@ -397,7 +372,6 @@ async def post_report(
         await db.commit()
         inserted_id = row[0] if row else None
     except Exception:
-        # Fallback TEXT
         await db.rollback()
         try:
             res = await db.execute(text("""
@@ -421,12 +395,16 @@ async def post_report(
             await db.rollback()
             raise HTTPException(500, f"report insert failed: {e2}")
 
-    # 2) Maintenir INCIDENTS / OUTAGES (vérité carte)
+    # 2) Mise à jour incidents/outages (vérité carte)
     try:
+        try:
+            await db.execute(text("SET LOCAL statement_timeout = '6s'"))
+        except Exception:
+            await db.rollback()
+
         if signal == "cut":
-            # Créer si pas déjà un actif à ~120 m
             if kind in ("power","water"):
-                # OUTAGES (enum outage_kind si présent, sinon TEXT)
+                # OUTAGES
                 try:
                     await db.execute(text("""
                         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
@@ -453,7 +431,7 @@ async def post_report(
                     """), {"kind": kind, "lng": p.lng, "lat": p.lat})
                 await db.commit()
             else:
-                # INCIDENTS (kind TEXT)
+                # INCIDENTS
                 await db.execute(text("""
                     WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
                     INSERT INTO incidents(kind, center, started_at, restored_at)
@@ -466,9 +444,8 @@ async def post_report(
                     )
                 """), {"kind": kind, "lng": p.lng, "lat": p.lat})
                 await db.commit()
-
         else:
-            # RESTORED : contrôle ownership pour non-admin — ADMIN BYPASS TOTAL
+            # RESTORED — ownership si non-admin
             if not is_admin:
                 if uid:
                     q = await db.execute(text("""
@@ -486,7 +463,6 @@ async def post_report(
                 else:
                     raise HTTPException(403, "not_owner")
 
-            # Mise à jour de la zone/incident proche
             if kind in ("power","water"):
                 try:
                     await db.execute(text("""
@@ -526,13 +502,11 @@ async def post_report(
 
     return {"ok": True, "id": inserted_id, "idempotency_key": idem}
 
-
+# --------- Admin: factory reset ----------
 @router.post("/admin/factory_reset")
 async def admin_factory_reset(request: Request, db: AsyncSession = Depends(get_db)):
-    _check_admin_token(request)  # nécessite x-admin-token
+    _check_admin_token(request)
     try:
-        # 1) tout vider (TRUNCATE + RESTART IDENTITY)
-        # NB: attachments n'existait pas dans ton wipe_all initial → on l'ajoute ici
         for ddl in [
             "TRUNCATE TABLE reports RESTART IDENTITY CASCADE",
             "TRUNCATE TABLE incidents RESTART IDENTITY CASCADE",
@@ -542,12 +516,10 @@ async def admin_factory_reset(request: Request, db: AsyncSession = Depends(get_d
             try:
                 await db.execute(text(ddl))
             except Exception:
-                # si la table n'existe pas encore, on ignore
                 await db.rollback()
 
         await db.commit()
 
-        # 2) ré-assurer le schéma minimal utile aux requêtes
         try:
             await db.execute(text("ALTER TABLE incidents ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
             await db.execute(text("ALTER TABLE outages   ADD COLUMN IF NOT EXISTS restored_at timestamp NULL"))
@@ -558,14 +530,11 @@ async def admin_factory_reset(request: Request, db: AsyncSession = Depends(get_d
             await db.commit()
         except Exception:
             await db.rollback()
-            # ne bloque pas le reset si ensure_schema a un souci
 
         return {"ok": True}
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"factory_reset failed: {e}")
-
-
 
 # --------- Upload image ----------
 @router.post("/upload_image")
@@ -585,7 +554,6 @@ async def upload_image(
         if not (-90 <= lat <= 90 and -180 <= lng <= 180):
             raise HTTPException(400, "invalid coordinates")
 
-        import mimetypes
         ct = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
         if not ct.startswith("image/"):
             raise HTTPException(400, "only image/* allowed")
@@ -597,10 +565,12 @@ async def upload_image(
         url = await _upload_to_supabase(content, file.filename or "photo.jpg", ct)
 
         uid = _to_uuid_or_none(user_id)
-
         await db.execute(text("""
             INSERT INTO attachments(kind, url, geom, user_id, idempotency_key, created_at)
-            VALUES (:kind, :url, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography, CAST(NULLIF(:uid,'') AS uuid), :idem, NOW())
+            VALUES (:kind, :url,
+                    ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                    CAST(NULLIF(:uid,'') AS uuid),
+                    :idem, NOW())
             ON CONFLICT (idempotency_key, url) DO NOTHING
         """), {"kind": k, "url": url, "lng": lng, "lat": lat, "uid": (uid or ""), "idem": idempotency_key})
         await db.commit()
@@ -608,10 +578,8 @@ async def upload_image(
         return {"ok": True, "url": url}
 
     except HTTPException:
-        # on propage tel quel (JSON)
         raise
     except Exception as e:
-        # attraper toute autre erreur et renvoyer JSON
         raise HTTPException(500, detail=f"upload_image failed: {e}")
 
 @router.get("/admin/supabase_status")
@@ -621,7 +589,6 @@ async def supabase_status():
         "SUPABASE_SERVICE_ROLE_set": bool(os.getenv("SUPABASE_SERVICE_ROLE")),
         "SUPABASE_BUCKET": os.getenv("SUPABASE_BUCKET", "attachments"),
     }
-
 
 # --------- RESET USER ----------
 @router.post("/reset_user")
@@ -636,9 +603,6 @@ async def reset_user(id: str = Query(..., alias="id"), db: AsyncSession = Depend
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"reset_user failed: {e}")
-
-# --------- ADMIN (identiques à avant, conservés) ----------
-# ... (garde tes endpoints admin existants inchangés)
 
 # --------- ADMIN maintenance ----------
 @router.post("/admin/wipe_all")
@@ -815,8 +779,6 @@ async def admin_delete_report(id: int = Query(...), db: AsyncSession = Depends(g
 
 # --- CSV exports ---
 from fastapi.responses import StreamingResponse
-import io, csv
-from datetime import datetime
 
 def _is_admin_req(request: Request):
     # accepte soit l'en-tête, soit ?token=...
@@ -972,11 +934,10 @@ async def admin_export_events_csv(
         res = await db.execute(sql, par)
         all_rows.extend([("incidents" if tname=="incidents" else "outages",) + tuple(r) for r in res.fetchall()])  # not used directly
 
-    # all_rows currently holds tuples prefixed; rebuild properly:
+    # build CSV
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["table","id","kind","status","lat","lng","started_at","restored_at","duration_min"])
-    # requery for consistency (clearer):
     for tname in tabs:
         sql, par = _build_sql(tname)
         res = await db.execute(sql, par)
@@ -997,11 +958,7 @@ async def admin_export_events_csv(
     return StreamingResponse(buf, media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=events.csv"})
 
-# --- GeoJSON & Aggregations ---
-from fastapi.responses import StreamingResponse
-import io, json
-from datetime import datetime
-
+# --- GeoJSON exports ---
 @router.get("/admin/export_reports.geojson")
 async def admin_export_reports_geojson(
     request: Request,
@@ -1075,7 +1032,6 @@ async def admin_export_reports_geojson(
     buf.seek(0)
     return StreamingResponse(buf, media_type="application/geo+json",
         headers={"Content-Disposition": "attachment; filename=reports.geojson"})
-
 
 @router.get("/admin/export_events.geojson")
 async def admin_export_events_geojson(
@@ -1156,9 +1112,7 @@ async def admin_export_events_geojson(
     return StreamingResponse(buf, media_type="application/geo+json",
         headers={"Content-Disposition": "attachment; filename=events.geojson"})
 
-from typing import List
-from fastapi import Query
-
+# --- Attachments près d'un point ---
 @router.get("/attachments_near")
 async def attachments_near(
     kind: str = Query(...),
@@ -1195,7 +1149,7 @@ async def attachments_near(
         } for r in rows
     ]
 
-
+# --- Agrégations CSV (reports/events) ---
 @router.get("/admin/export_aggregated.csv")
 async def admin_export_aggregated_csv(
     request: Request,
@@ -1254,7 +1208,7 @@ async def admin_export_aggregated_csv(
 
     else:  # events
         tabs = ["incidents","outages"] if table in (None,"both","") else [table]
-        # on agrège en UNION ALL puis regroupement Python (plus simple)
+        # on agrège en UNION ALL puis regroupement Python
         rows = []
         for tname in tabs:
             where = ["1=1"]; params = {}
@@ -1284,14 +1238,13 @@ async def admin_export_aggregated_csv(
             day = r.day
             kindv = r.kind
             statusv = r.status
-            key = None
             if by == "day":
                 key = (str(day),)
             elif by == "kind":
                 key = (kindv,)
             elif by == "day_kind":
                 key = (str(day), kindv)
-            else:  # day_kind_status
+            else:
                 key = (str(day), kindv, statusv)
             agg[key]["n"] += 1
             if r.started_at and r.restored_at:
@@ -1313,7 +1266,7 @@ async def admin_export_aggregated_csv(
         for key, val in sorted(agg.items()):
             avg = ""
             if val["dur_sum"] > 0 and val["n"] > 0:
-                # moyenne sur les éléments avec durée (approx via dur_sum / n ; ok si peu de non-restored)
+                # moyenne sur éléments avec durée (approx via dur_sum / n)
                 avg = round(val["dur_sum"] / val["n"], 2)
             row = list(key) + [val["n"], avg,
                                round(val["dur_min"],2) if val["dur_min"] is not None else "",
