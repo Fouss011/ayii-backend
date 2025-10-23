@@ -7,32 +7,7 @@ from uuid import UUID
 import os, uuid
 
 from app.db import get_db
-from app.config import BASE_PUBLIC_URL, STATIC_DIR, STATIC_URL_PATH  # ← depuis app.config
-
-router = APIRouter()  # PAS de FastAPI() ici
-
-
-# --- CORS : en prod, remplace "*" par l'URL de ton front (ex: "https://app.tondomaine.com")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],          # sécurisé: mets ton domaine front ici en prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
-)
-
-# --- URL publique du backend (à définir en variable d'env en prod)
-BASE_PUBLIC_URL = os.getenv("BASE_PUBLIC_URL", "http://localhost:8000").rstrip("/")
-
-# --- Dossier local où seront stockées les images (fallback local)
-STATIC_DIR = os.getenv("STATIC_DIR", "/tmp/attachments")
-os.makedirs(STATIC_DIR, exist_ok=True)
-
-# --- Exposer les fichiers statiques: http(s)://<BACKEND>/static/<fichier>.jpg
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
+from app.config import BASE_PUBLIC_URL, STATIC_DIR, STATIC_URL_PATH  # ← OK maintenant
 
 router = APIRouter()
 
