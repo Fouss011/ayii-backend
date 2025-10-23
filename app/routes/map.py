@@ -2,9 +2,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-from typing import Optional, List
 from uuid import UUID
 import os, uuid
+from pydantic import BaseModel
+from typing import Optional, List, Any
 
 from app.db import get_db
 from ..config import BASE_PUBLIC_URL, STATIC_DIR, STATIC_URL_PATH
