@@ -218,15 +218,90 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
         for r in rows
     ]
 
+# ---------- LECTURES GLOBAL (ignorer le centre/rayon) ----------
+async def fetch_outages_all(db: AsyncSession, limit: int = 2000):
+    q = text("""
+        SELECT o.id,
+               o.kind::text AS kind,
+               CASE WHEN o.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+               ST_Y((o.center::geometry)) AS lat,
+               ST_X((o.center::geometry)) AS lng,
+               o.started_at,
+               o.restored_at,
+               COALESCE(att.cnt, 0)::int AS attachments_count
+        FROM outages o
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS cnt
+            FROM attachments a
+           WHERE a.kind::text = o.kind::text
+             AND a.created_at > NOW() - INTERVAL '48 hours'
+             AND ST_DWithin((a.geom::geography), (o.center::geography), 120)
+        ) att ON TRUE
+        WHERE o.restored_at IS NULL
+        ORDER BY o.started_at DESC NULLS LAST, o.id DESC
+        LIMIT :lim
+    """)
+    res = await db.execute(q, {"lim": limit})
+    rows = res.fetchall()
+    return [
+        {
+            "id": r.id, "kind": r.kind, "status": r.status,
+            "lat": float(r.lat), "lng": float(r.lng),
+            "started_at": getattr(r, "started_at", None),
+            "restored_at": getattr(r, "restored_at", None),
+            "attachments_count": getattr(r, "attachments_count", 0),
+        } for r in rows
+    ]
+
+async def fetch_incidents_all(db: AsyncSession, limit: int = 2000):
+    q = text("""
+        SELECT i.id,
+               i.kind::text AS kind,
+               CASE WHEN i.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
+               ST_Y((i.center::geometry)) AS lat,
+               ST_X((i.center::geometry)) AS lng,
+               i.started_at,
+               i.restored_at,
+               COALESCE(att.cnt, 0)::int AS attachments_count
+        FROM incidents i
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS cnt
+            FROM attachments a
+           WHERE a.kind::text = i.kind::text
+             AND a.created_at > NOW() - INTERVAL '48 hours'
+             AND ST_DWithin((a.geom::geography), (i.center::geography), 120)
+        ) att ON TRUE
+        WHERE i.restored_at IS NULL
+        ORDER BY i.started_at DESC NULLS LAST, i.id DESC
+        LIMIT :lim
+    """)
+    res = await db.execute(q, {"lim": limit})
+    rows = res.fetchall()
+    return [
+        {
+            "id": r.id, "kind": r.kind, "status": r.status,
+            "lat": float(r.lat), "lng": float(r.lng),
+            "started_at": getattr(r, "started_at", None),
+            "restored_at": getattr(r, "restored_at", None),
+            "attachments_count": getattr(r, "attachments_count", 0),
+        } for r in rows
+    ]
+
+
 # ---------- ENDPOINT /map ----------
 @router.get("/map")
 async def map_endpoint(
     lat: float = Query(..., ge=-90, le=90),
     lng: float = Query(..., ge=-180, le=180),
     radius_km: float = Query(5.0, gt=0, le=50),
+    show_all: bool = Query(False, description="Si true: renvoie tous les événements actifs (cap)."),
     response: Response = None,
     db: AsyncSession = Depends(get_db),
 ):
+    from datetime import datetime, timezone
+    def nowz():
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
     try:
         # 0) Auto-clôture incidents/outages anciens (si activé)
         try:
@@ -247,6 +322,22 @@ async def map_endpoint(
         except Exception:
             await db.rollback()
 
+        # 👉 Mode GLOBAL: on ignore centre/rayon, on renvoie tous les actifs (cap)
+        if show_all:
+            outages   = await fetch_outages_all(db, limit=2000)
+            incidents = await fetch_incidents_all(db, limit=2000)
+            payload = {
+                "outages": outages,
+                "incidents": incidents,
+                "last_reports": [],   # on allège en global
+                "server_now": nowz(),
+            }
+            if response is not None:
+                response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+                response.headers["Pragma"] = "no-cache"
+            return payload
+
+        # --- mode LOCAL (comportement historique) ---
         r_m = float(radius_km * 1000.0)
 
         outages   = await fetch_outages(db, lat, lng, r_m)
@@ -288,7 +379,7 @@ async def map_endpoint(
             "outages": outages,
             "incidents": incidents,
             "last_reports": last_reports,
-            "server_now": _now_isoz(),
+            "server_now": nowz(),
         }
         if response is not None:
             response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
@@ -304,9 +395,10 @@ async def map_endpoint(
             "outages": [],
             "incidents": [],
             "last_reports": [],
-            "server_now": _now_isoz(),
+            "server_now": nowz(),
             "error": f"{type(e).__name__}: {e}",
         }
+
 
 # --------- POST /report ----------
 class ReportIn(BaseModel):
