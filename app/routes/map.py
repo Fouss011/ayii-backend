@@ -1,22 +1,16 @@
 # app/routes/map.py
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request, Header, UploadFile, File, Form, Body
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-from typing import Optional, Any, List
-from app.db import get_db
-import os, uuid, mimetypes, io, csv, json
-from datetime import datetime, timezone
+from typing import Optional, List
 from uuid import UUID
-from app.main import STATIC_DIR, BASE_PUBLIC_URL
+import os, uuid
 
-# app/main.py
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import os
+from app.db import get_db
+from app.config import BASE_PUBLIC_URL, STATIC_DIR, STATIC_URL_PATH  # ← depuis app.config
 
-app = FastAPI()
+router = APIRouter()  # PAS de FastAPI() ici
+
 
 # --- CORS : en prod, remplace "*" par l'URL de ton front (ex: "https://app.tondomaine.com")
 app.add_middleware(
@@ -672,7 +666,7 @@ async def upload_image(
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
-    # --- simple admin check (optional) ---
+    # --- sécurité admin simple
     is_admin = False
     try:
         admin_hdr = (request.headers.get("x-admin-token") or "").strip()
@@ -685,28 +679,21 @@ async def upload_image(
     if K not in {"traffic", "accident", "fire", "flood", "power", "water"}:
         raise HTTPException(status_code=400, detail="invalid kind")
 
-    # read bytes
+    # lecture du contenu
     data = await file.read()
     if not data or len(data) > 15 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="file too large or empty")
 
-    # idempotency: if same key already stored, return its URL
+    # idempotency
     if idempotency_key:
         q = text("SELECT id, url FROM attachments WHERE idempotency_key = :k LIMIT 1")
         rs = await db.execute(q, {"k": idempotency_key})
         row = rs.first()
         if row:
-            url = row.url
-            # normalize to absolute
-            if not (str(url).startswith("http://") or str(url).startswith("https://")):
-                if str(url).startswith("/"):
-                    url = f"{BASE_PUBLIC_URL}{url}"
-                else:
-                    url = f"{BASE_PUBLIC_URL}/static/{url}"
-            return {"ok": True, "id": str(row.id), "url": url, "idempotency_key": idempotency_key}
+            return {"ok": True, "id": str(row.id), "url": row.url, "idempotency_key": idempotency_key}
 
-    # --- ownership check for non-admin: must have recent CUT report near (lat,lng) with same kind
-    if not is_eladmin:
+    # --- Ownership check si pas admin
+    if not is_admin:
         if not user_id:
             raise HTTPException(status_code=403, detail="not_owner")
         chk = text("""
@@ -717,74 +704,72 @@ async def upload_image(
                AND LOWER(TRIM(kind::text)) = :k
                AND LOWER(TRIM(signal::text)) = 'cut'
                AND created_at > NOW() - INTERVAL '48 hours'
-               AND ST_DWithin((geom::geography), (SELECT g FROM me), 150)
+               AND ST_DWithin((geom::geography),(SELECT g FROM me),150)
              LIMIT 1
         """)
         rs = await db.execute(chk, {"uid": str(user_id), "k": K, "lat": lat, "lng": lng})
         if rs.first() is None:
             raise HTTPException(status_code=403, detail="not_owner")
 
-    # --- store file: prefer Supabase if configured, else local filesystem under STATIC_DIR
-    url_public: Optional[str] = None
+    # --- stockage (Supabase si config, sinon local dans STATIC_DIR + URL publique via /static)
+    url_public = None
     try:
         bucket = os.getenv("ATTACH_BUCKET", "attachments")
-        filename_only = f"{K}_{uuid.uuid4()}.jpg"  # we’ll store this name in local case
+        filename = f"{K}_{uuid.uuid4()}.jpg"
 
         supa_url = os.getenv("SUPABASE_URL")
         supa_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+
         if supa_url and supa_key:
             from supabase import create_client
             client = create_client(supa_url, supa_key)
-            path_in_bucket = f"{K}/{filename_only}"
             client.storage.from_(bucket).upload(
-                path=path_in_bucket,
+                path=f"{K}/{filename}",
                 file=data,
                 file_options={"content-type": file.content_type or "image/jpeg", "upsert": False},
             )
-            # absolute public URL from Supabase
-            url_public = client.storage.from_(bucket).get_public_url(path_in_bucket)
+            url_public = client.storage.from_(bucket).get_public_url(f"{K}/{filename}")
         else:
-            # local fallback
+            # Écrit directement dans STATIC_DIR et construit l’URL /static/…
             os.makedirs(STATIC_DIR, exist_ok=True)
-            fpath = os.path.join(STATIC_DIR, filename_only)
-            with open(fpath, "wb") as fp:
+            disk_path = os.path.join(STATIC_DIR, filename)
+            with open(disk_path, "wb") as fp:
                 fp.write(data)
-            # absolute URL via our mounted /static
-            url_public = f"{BASE_PUBLIC_URL}/static/{filename_only}"
+            base = BASE_PUBLIC_URL or ""   # peut être vide en dev local
+            if base:
+                url_public = f"{base}{STATIC_URL_PATH}/{filename}"
+            else:
+                # fallback relatif (fonctionne si le frontend appelle le même host)
+                url_public = f"{STATIC_URL_PATH}/{filename}"
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"storage_error: {e}")
 
     if not url_public:
         raise HTTPException(status_code=500, detail="no_public_url")
 
-    # --- persist attachment row
+    # --- insert DB
     ins = text("""
-        INSERT INTO attachments (kind, geom, user_id, url, idempotency_key, created_at)
-        VALUES (
-            :k,
-            ST_SetSRID(ST_MakePoint(:lng,:lat), 4326),
-            :uid,
-            :url,
-            :idem,
-            NOW()
-        )
-        RETURNING id
+      INSERT INTO attachments (kind, geom, user_id, url, idempotency_key, created_at)
+      VALUES (
+        :k,
+        ST_SetSRID(ST_MakePoint(:lng,:lat),4326),
+        :uid,
+        :url,
+        :idem,
+        NOW()
+      )
+      RETURNING id
     """)
     rs = await db.execute(
         ins,
-        {
-            "k": K,
-            "lng": lng,
-            "lat": lat,
-            "uid": str(user_id) if user_id else None,
-            "url": url_public,                 # store the absolute URL (works for both supabase/local)
-            "idem": idempotency_key,
-        },
+        {"k": K, "lng": lng, "lat": lat, "uid": str(user_id) if user_id else None, "url": url_public, "idem": idempotency_key},
     )
     row = rs.first()
     await db.commit()
 
     return {"ok": True, "id": str(row.id), "url": url_public, "idempotency_key": idempotency_key}
+
 
 
 
@@ -1326,19 +1311,19 @@ async def attachments_near(
     lat: float = Query(..., ge=-90, le=90),
     lng: float = Query(..., ge=-180, le=180),
     radius_m: int = Query(150, ge=10, le=2000),
-    hours: int = Query(72, ge=1, le=240),
+    hours: int = Query(48, ge=1, le=168),
     db: AsyncSession = Depends(get_db),
 ):
     k = (kind or "").strip().lower()
-    if k not in {"traffic", "accident", "fire", "flood", "power", "water"}:
+    if k not in {"traffic","accident","fire","flood","power","water"}:
         raise HTTPException(status_code=400, detail="invalid kind")
 
-    q = text(f"""
+    sql = text(f"""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
         SELECT id,
                url,
-               ST_Y(geom::geometry) AS lat,
-               ST_X(geom::geometry) AS lng,
+               ST_Y((geom::geometry)) AS lat,
+               ST_X((geom::geometry)) AS lng,
                user_id,
                created_at
           FROM attachments
@@ -1348,32 +1333,20 @@ async def attachments_near(
          ORDER BY created_at DESC, id DESC
          LIMIT 200
     """)
-    rs = await db.execute(q, {"kind": k, "lng": lng, "lat": lat, "r": radius_m})
+    rs = await db.execute(sql, {"kind": k, "lng": lng, "lat": lat, "r": radius_m})
     rows = rs.fetchall()
-
-    out = []
-    base = BASE_PUBLIC_URL  # already rstrip('/')
-
-    for r in rows:
-        raw = str(r.url or "")
-        if raw.startswith("http://") or raw.startswith("https://"):
-            final_url = raw
-        elif raw.startswith("/"):
-            final_url = f"{base}{raw}"
-        else:
-            # if DB has only filename, serve from /static
-            final_url = f"{base}/static/{raw}"
-
-        out.append({
-            "id": str(r.id),
-            "url": final_url,
+    return [
+        {
+            "id": r.id,
+            "url": r.url,
             "lat": float(r.lat),
             "lng": float(r.lng),
-            "user_id": str(r.user_id) if r.user_id else None,
+            "user_id": r.user_id,
             "created_at": r.created_at.isoformat() if r.created_at else None,
-        })
+        }
+        for r in rows
+    ]
 
-    return out
 
 # --- Agrégations CSV (reports/events) ---
 @router.get("/admin/export_aggregated.csv")
