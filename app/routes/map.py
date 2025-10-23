@@ -634,45 +634,107 @@ async def upload_image(
     kind: str = Form(...),
     lat: float = Form(...),
     lng: float = Form(...),
+    user_id: Optional[UUID] = Form(None),
     idempotency_key: Optional[str] = Form(None),
-    user_id: Optional[str] = Form(None),
     file: UploadFile = File(...),
+    request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
+    # --- sécurité basique admin ---
+    is_admin = False
     try:
-        k = (kind or "").lower().strip()
-        if k not in {"traffic","accident","fire","flood","power","water"}:
-            raise HTTPException(400, "invalid kind")
-        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-            raise HTTPException(400, "invalid coordinates")
+      admin_hdr = (request.headers.get("x-admin-token") or "").strip()
+      if admin_hdr and admin_hdr == (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or ""):
+          is_admin = True
+    except Exception:
+      pass
 
-        ct = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
-        if not ct.startswith("image/"):
-            raise HTTPException(400, "only image/* allowed")
+    K = (kind or "").strip().lower()
+    if K not in {"traffic","accident","fire","flood","power","water"}:
+        raise HTTPException(status_code=400, detail="invalid kind")
 
-        content = await file.read()
-        if len(content) > 5 * 1024 * 1024:
-            raise HTTPException(413, "file too large (max 5MB)")
+    # lecture du contenu
+    data = await file.read()
+    if not data or len(data) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="file too large or empty")
 
-        url = await _upload_to_supabase(content, file.filename or "photo.jpg", ct)
+    # idempotency: si déjà présent, retourner l’existant
+    if idempotency_key:
+        q = text("""
+          SELECT id, url FROM attachments WHERE idempotency_key = :k LIMIT 1
+        """)
+        rs = await db.execute(q, {"k": idempotency_key})
+        row = rs.first()
+        if row:
+            return {"ok": True, "id": str(row.id), "url": row.url, "idempotency_key": idempotency_key}
 
-        uid = _to_uuid_or_none(user_id)
-        await db.execute(text("""
-            INSERT INTO attachments(kind, url, geom, user_id, idempotency_key, created_at)
-            VALUES (:kind, :url,
-                    ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-                    CAST(NULLIF(:uid,'') AS uuid),
-                    :idem, NOW())
-            ON CONFLICT (idempotency_key, url) DO NOTHING
-        """), {"kind": k, "url": url, "lng": lng, "lat": lat, "uid": (uid or ""), "idem": idempotency_key})
-        await db.commit()
+    # --- Ownership check (si pas admin) ---
+    if not is_admin:
+        if not user_id:
+            raise HTTPException(status_code=403, detail="not_owner")
+        chk = text("""
+          WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+          SELECT 1
+            FROM reports
+           WHERE user_id = :uid
+             AND LOWER(TRIM(kind::text)) = :k
+             AND LOWER(TRIM(signal::text)) = 'cut'
+             AND created_at > NOW() - INTERVAL '48 hours'
+             AND ST_DWithin((geom::geography),(SELECT g FROM me),150)
+           LIMIT 1
+        """)
+        rs = await db.execute(chk, {"uid": str(user_id), "k": K, "lat": lat, "lng": lng})
+        if rs.first() is None:
+            raise HTTPException(status_code=403, detail="not_owner")
 
-        return {"ok": True, "url": url}
+    # --- stockage du binaire (ex: Supabase Storage / S3 / local) ---
+    # Ici: exemple Supabase Storage si SUPABASE_URL & SUPABASE_KEY présents, sinon local /tmp
+    url_public = None
+    try:
+        bucket = os.getenv("ATTACH_BUCKET", "attachments")
+        fn = f"{K}/{uuid.uuid4()}.jpg"
 
-    except HTTPException:
-        raise
+        supa_url = os.getenv("SUPABASE_URL")
+        supa_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+        if supa_url and supa_key:
+            from supabase import create_client
+            client = create_client(supa_url, supa_key)
+            # upload
+            client.storage.from_(bucket).upload(path=fn, file=data, file_options={"content-type": file.content_type or "image/jpeg", "upsert": False})
+            # URL publique
+            url_public = client.storage.from_(bucket).get_public_url(fn)
+        else:
+            # fallback local (dev)
+            os.makedirs("/tmp/attachments", exist_ok=True)
+            path = f"/tmp/attachments/{fn.replace('/','_')}"
+            with open(path, "wb") as fp:
+                fp.write(data)
+            url_public = f"/static/{os.path.basename(path)}"  # à servir par nginx en dev
     except Exception as e:
-        raise HTTPException(500, detail=f"upload_image failed: {e}")
+        raise HTTPException(status_code=500, detail=f"storage_error: {e}")
+
+    if not url_public:
+        raise HTTPException(status_code=500, detail="no_public_url")
+
+    # --- insert DB + incrément compteur via trigger ou vue matérialisée côté lecture ---
+    ins = text("""
+      INSERT INTO attachments (kind, geom, user_id, url, idempotency_key, created_at)
+      VALUES (
+        :k,
+        ST_SetSRID(ST_MakePoint(:lng,:lat),4326),
+        :uid,
+        :url,
+        :idem,
+        NOW()
+      )
+      RETURNING id
+    """)
+    rs = await db.execute(ins, {"k": K, "lng": lng, "lat": lat, "uid": str(user_id) if user_id else None, "url": url_public, "idem": idempotency_key})
+    row = rs.first()
+    await db.commit()
+
+    return {"ok": True, "id": str(row.id), "url": url_public, "idempotency_key": idempotency_key}
+
 
 @router.get("/admin/supabase_status")
 async def supabase_status():
