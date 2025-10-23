@@ -7,7 +7,8 @@ from uuid import UUID
 import os, uuid
 
 from app.db import get_db
-from app.config import BASE_PUBLIC_URL, STATIC_DIR, STATIC_URL_PATH  # ← OK maintenant
+from ..config import BASE_PUBLIC_URL, STATIC_DIR, STATIC_URL_PATH
+
 
 router = APIRouter()
 

@@ -3,7 +3,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
 
-from app.config import STATIC_DIR, STATIC_URL_PATH  # ← depuis app.config
+from .config import STATIC_DIR, STATIC_URL_PATH
+
 
 app = FastAPI()
 
