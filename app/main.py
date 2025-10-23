@@ -1,33 +1,25 @@
 # app/main.py
-from contextlib import asynccontextmanager
-import os
-import pathlib
-
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
 
-from app.config import STATIC_DIR, STATIC_URL_PATH  # ← config centrale
-
-load_dotenv()
+from app.config import STATIC_DIR, STATIC_URL_PATH  # ← depuis app.config
 
 app = FastAPI()
 
-# CORS — en prod, remplace "*" par l’URL de ton front
+# CORS (mets ton domaine front en prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
 )
 
-# Servir les fichiers statiques (images uploadées en local)
+# Monter /static -> STATIC_DIR
 app.mount(STATIC_URL_PATH, StaticFiles(directory=STATIC_DIR), name="static")
 
-# ⚠️ inclure les routes APRES la création de app et le mount static
+# (après le mount) inclure les routes API
 from app.routes.map import router as map_router
 app.include_router(map_router, prefix="/api")
 
