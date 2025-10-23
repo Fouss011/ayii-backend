@@ -738,6 +738,7 @@ async def upload_image(
     return {"ok": True, "id": str(row.id), "url": url_public, "idempotency_key": idempotency_key}
 
 
+
 @router.get("/admin/supabase_status")
 async def supabase_status():
     return {
