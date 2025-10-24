@@ -754,37 +754,44 @@ async def upload_image(
         if rs.first() is None:
             raise HTTPException(status_code=403, detail="not_owner")
 
-    # --- stockage (Supabase si config, sinon local dans STATIC_DIR + URL publique via /static)
+    # --- stockage (Supabase si config, sinon local)
     url_public = None
     try:
-        bucket = os.getenv("ATTACH_BUCKET", "attachments")
+        bucket = os.getenv("SUPABASE_BUCKET", "attachments")  # <-- bucket correct
         filename = f"{K}_{uuid.uuid4()}.jpg"
 
-        supa_url = os.getenv("SUPABASE_URL")
-        supa_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+        supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+        supa_key = os.getenv("SUPABASE_SERVICE_ROLE")  # <-- utilise la clé service rôle
 
         if supa_url and supa_key:
-            from supabase import create_client
-            client = create_client(supa_url, supa_key)
-            client.storage.from_(bucket).upload(
-                path=f"{K}/{filename}",
-                file=data,
-                file_options={"content-type": file.content_type or "image/jpeg", "upsert": False},
-            )
-            url_public = client.storage.from_(bucket).get_public_url(f"{K}/{filename}")
+            # Upload direct via API HTTP (léger et fiable en prod)
+            import httpx, time as _time
+            path = f"{K}/{int(_time.time())}-{filename}"
+            upload_url = f"{supa_url}/storage/v1/object/{bucket}/{path}"
+            headers = {
+                "Authorization": f"Bearer {supa_key}",
+                "Content-Type": file.content_type or "image/jpeg",
+                "x-upsert": "false",
+            }
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(upload_url, headers=headers, content=data)
+                if r.status_code not in (200, 201):
+                    raise HTTPException(500, f"supabase upload failed [{r.status_code}]: {r.text}")
+            url_public = f"{supa_url}/storage/v1/object/public/{bucket}/{path}"
         else:
-            # Écrit directement dans STATIC_DIR et construit l’URL /static/…
+            # Fallback local (/static) — utile en dev local seulement
             os.makedirs(STATIC_DIR, exist_ok=True)
             disk_path = os.path.join(STATIC_DIR, filename)
             with open(disk_path, "wb") as fp:
                 fp.write(data)
-            base = BASE_PUBLIC_URL or ""   # peut être vide en dev local
+            base = BASE_PUBLIC_URL or ""
             if base:
                 url_public = f"{base}{STATIC_URL_PATH}/{filename}"
             else:
-                # fallback relatif (fonctionne si le frontend appelle le même host)
                 url_public = f"{STATIC_URL_PATH}/{filename}"
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"storage_error: {e}")
 
@@ -812,7 +819,6 @@ async def upload_image(
     await db.commit()
 
     return {"ok": True, "id": str(row.id), "url": url_public, "idempotency_key": idempotency_key}
-
 
 
 
