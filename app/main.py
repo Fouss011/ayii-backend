@@ -1,45 +1,41 @@
 # app/main.py
 import os
-from fastapi import FastAPI
+import pathlib
+import hashlib
+from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
 
-from app.config import STATIC_DIR, STATIC_URL_PATH  # ← depuis app.config
+# Scheduler (facultatif)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
-app = FastAPI()
+# Config & services internes
+from app.config import STATIC_DIR, STATIC_URL_PATH           # constants (pas d'app ici)
+from app.db import get_db                                   # async session factory
+from app.services.aggregation import run_aggregation        # ta tâche d’agrégation
 
-# CORS (remplace "*" par l’URL de ton front en prod)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
-)
-
-# Monter les fichiers statiques pour servir les images locales
-app.mount(STATIC_URL_PATH, StaticFiles(directory=STATIC_DIR), name="static")
-
-# ⚠️ Important: importer le router APRÈS la config ci-dessus pour éviter les imports circulaires
-from app.routes.map import router as map_router  # noqa: E402
-app.include_router(map_router, prefix="/api")
-
-
-# -------------------------------------------------------------------
-# .env en local (pas sur Render/Prod)
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Chargement .env en local (pas sur Render/Prod)
+# -----------------------------------------------------------------------------
 if os.getenv("RENDER") is None and os.getenv("ENV", "dev") == "dev":
     load_dotenv()
 
-scheduler = AsyncIOScheduler()
-
+# -----------------------------------------------------------------------------
+# Lifespan avec scheduler optionnel
+# -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ---------------- Startup ----------------
+    # --- Startup ---
     enable = os.getenv("SCHEDULER_ENABLED", "1") != "0"
+    scheduler = None
+
     if enable:
         interval = int(os.getenv("AGG_INTERVAL_MIN", "2"))
+        scheduler = AsyncIOScheduler()
 
         async def job():
             agen = get_db()                 # async generator
@@ -65,33 +61,35 @@ async def lifespan(app: FastAPI):
     else:
         print("[scheduler] disabled via SCHEDULER_ENABLED=0")
 
+    # Rendez le scheduler accessible si besoin
+    app.state.scheduler = scheduler
+
     yield
 
-    # ---------------- Shutdown ----------------
-    if scheduler.running:
+    # --- Shutdown ---
+    if scheduler and scheduler.running:
         scheduler.shutdown(wait=False)
         print("[scheduler] stopped")
 
 
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # App
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 app = FastAPI(title="Ayii API", lifespan=lifespan)
 
-# debug token admin (masqué)
+# Debug token admin (masqué)
 tok = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
 print(f"[admin-token] len={len(tok)} head={tok[:4]} tail={tok[-4:]}")
 
-# -------------------------------------------------------------------
-# CORS (important: doit être ajouté AVANT d'inclure les routers)
-# -------------------------------------------------------------------
-# Origines autorisées "dures"
+# -----------------------------------------------------------------------------
+# CORS (IMPORTANT: avant d'inclure les routers)
+# -----------------------------------------------------------------------------
 allowed_origins = {
     "https://ayii.netlify.app",
     "http://localhost:3000",
 }
 
-# Surcharge via variable d'env ALLOWED_ORIGINS="https://foo.netlify.app,https://bar.com"
+# Surcharge via ALLOWED_ORIGINS="https://foo.netlify.app,https://bar.com"
 extra = (os.getenv("ALLOWED_ORIGINS") or "").strip()
 if extra:
     for o in extra.split(","):
@@ -107,48 +105,28 @@ app.add_middleware(
     allow_origins=sorted(list(allowed_origins)),
     allow_origin_regex=NETLIFY_REGEX,
     allow_credentials=False,              # pas de cookies cross-site
-    allow_methods=["*"],                  # GET, POST, OPTIONS, PUT, PATCH, DELETE, ...
-    allow_headers=["*"],                  # Content-Type, x-admin-token, Authorization, ...
+    allow_methods=["*"],
+    allow_headers=["*"],
     expose_headers=["Content-Disposition"],
     max_age=86400,
 )
 
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Fichiers statiques (pour servir les images locales uploadées)
+# -----------------------------------------------------------------------------
+# Exemple: http(s)://<backend>/static/<filename>.jpg
+app.mount(STATIC_URL_PATH, StaticFiles(directory=STATIC_DIR), name="static")
+
+# -----------------------------------------------------------------------------
 # Health
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-# -------------------------------------------------------------------
-# Routes
-# -------------------------------------------------------------------
-from app.routes.map import router as map_router
-from app.routes.dev import router as dev_router
-
-# Optionnels si présents (protégés par try)
-try:
-    from app.routes.reverse import router as reverse_router
-    app.include_router(reverse_router)
-except Exception:
-    pass
-
-try:
-    from app.routes.outages import router as outages_router
-    app.include_router(outages_router)
-except Exception:
-    pass
-
-# Router principal (contient /map, /report, /reset_user, etc.)
-app.include_router(map_router)
-
-# n’activer /dev/* qu’en dev
-if os.getenv("ENV", "dev") == "dev":
-    app.include_router(dev_router)
-
-# -------------------------------------------------------------------
-# Outils dev (exposés uniquement en ENV=dev)
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Dev helpers (uniquement en ENV=dev)
+# -----------------------------------------------------------------------------
 def _sha(path: str):
     p = pathlib.Path(path)
     if not p.exists():
@@ -174,12 +152,34 @@ if os.getenv("ENV", "dev") == "dev":
             },
         }
 
-# -------------------------------------------------------------------
-# no-store pour /map (évite cache côté CDN/navigateur)
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# no-store pour /map (éviter cache navigateur/CDN)
+# -----------------------------------------------------------------------------
 @app.middleware("http")
 async def no_store_cache(request: Request, call_next):
     response: Response = await call_next(request)
     if request.url.path == "/map":
         response.headers["Cache-Control"] = "no-store"
     return response
+
+# -----------------------------------------------------------------------------
+# Routes (IMPORTER APRÈS la config ci-dessus)
+# -----------------------------------------------------------------------------
+from app.routes.map import router as map_router   # noqa: E402
+app.include_router(map_router)
+
+# /dev/* uniquement en dev
+try:
+    if os.getenv("ENV", "dev") == "dev":
+        from app.routes.dev import router as dev_router  # noqa: E402
+        app.include_router(dev_router)
+except Exception:
+    pass
+
+# Optionnels si présents
+for opt in ("reverse", "outages"):
+    try:
+        mod = __import__(f"app.routes.{opt}", fromlist=["router"])
+        app.include_router(getattr(mod, "router"))
+    except Exception:
+        pass
