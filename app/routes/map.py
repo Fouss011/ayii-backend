@@ -33,6 +33,12 @@ SUPABASE_URL         = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY         = os.getenv("SUPABASE_SERVICE_ROLE", "")
 SUPABASE_BUCKET      = os.getenv("SUPABASE_BUCKET", "attachments")
 
+ALERT_RADIUS_M   = int(os.getenv("ALERT_RADIUS_M", "100"))   # rayon des zones d'alerte (≈100m)
+ALERT_WINDOW_H   = int(os.getenv("ALERT_WINDOW_H", "3"))     # fenêtre de temps pour les preuves (3h)
+ALERT_THRESHOLD  = int(os.getenv("ALERT_THRESHOLD", "3"))    # nb min de signalements pour une zone
+RESPONDER_TOKEN  = (os.getenv("RESPONDER_TOKEN") or "").strip()  # jeton simple pour “pompiers”
+
+
 # --------- Helpers ----------
 def _to_uuid_or_none(val: Optional[str]):
     try:
@@ -293,6 +299,58 @@ async def fetch_incidents_all(db: AsyncSession, limit: int = 2000):
         } for r in rows
     ]
 
+async def fetch_alert_zones(db: AsyncSession, lat: float, lng: float, r_m: float):
+    """
+    Regroupe les reports 'cut' récents (ALERT_WINDOW_H) dans des cellules ~100m,
+    et ne renvoie que celles dont le compteur >= ALERT_THRESHOLD,
+    en retirant celles 'prises en charge' (responder_claims) à proximité.
+    """
+    # bin ~ 0.001° ~ 111m
+    q = text(f"""
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+        ),
+        recent AS (
+          SELECT
+            LOWER(TRIM(kind::text)) AS kind,
+            ROUND(CAST(ST_Y(geom::geometry) AS numeric), 3) AS lat_bin,
+            ROUND(CAST(ST_X(geom::geometry) AS numeric), 3) AS lng_bin,
+            AVG(ST_Y(geom::geometry)) AS lat,
+            AVG(ST_X(geom::geometry)) AS lng,
+            COUNT(*)::int AS n
+          FROM reports
+          WHERE LOWER(TRIM(signal::text))='cut'
+            AND created_at > NOW() - INTERVAL '{ALERT_WINDOW_H} hours'
+            AND ST_DWithin((geom::geography), (SELECT g FROM me), :r)
+          GROUP BY 1,2,3
+        ),
+        with_claim AS (
+          SELECT r.kind, r.lat, r.lng, r.n,
+                 EXISTS (
+                   SELECT 1 FROM responder_claims c
+                   WHERE c.kind = r.kind
+                     AND ST_DWithin(
+                       ST_SetSRID(ST_MakePoint(r.lng, r.lat),4326)::geography,
+                       c.center, :ack_r
+                     )
+                 ) AS acknowledged
+          FROM recent r
+        )
+        SELECT kind, lat::float, lng::float, n::int, acknowledged
+        FROM with_claim
+        WHERE n >= :th
+        ORDER BY n DESC, kind ASC
+        LIMIT 500
+    """)
+    res = await db.execute(q, {"lng": lng, "lat": lat, "r": r_m, "th": ALERT_THRESHOLD, "ack_r": max(ALERT_RADIUS_M, 120)})
+    rows = res.fetchall()
+    return [
+        {"kind": r.kind, "lat": float(r.lat), "lng": float(r.lng),
+         "radius_m": ALERT_RADIUS_M, "count": int(r.n), "acknowledged": bool(r.acknowledged)}
+        for r in rows
+        if not bool(r.acknowledged)  # on masque celles déjà prises en charge
+    ]
+
 
 # ---------- ENDPOINT /map ----------
 @router.get("/map")
@@ -304,7 +362,6 @@ async def map_endpoint(
     response: Response = None,
     db: AsyncSession = Depends(get_db),
 ):
-    from datetime import datetime, timezone
     def nowz():
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -328,14 +385,15 @@ async def map_endpoint(
         except Exception:
             await db.rollback()
 
-        # 👉 Mode GLOBAL: on ignore centre/rayon, on renvoie tous les actifs (cap)
+        # 👉 Mode GLOBAL: on peut alléger (pas de last_reports ni alert_zones)
         if show_all:
             outages   = await fetch_outages_all(db, limit=2000)
             incidents = await fetch_incidents_all(db, limit=2000)
             payload = {
                 "outages": outages,
                 "incidents": incidents,
-                "last_reports": [],   # on allège en global
+                "alert_zones": [],     # allégé en global
+                "last_reports": [],
                 "server_now": nowz(),
             }
             if response is not None:
@@ -348,7 +406,9 @@ async def map_endpoint(
 
         outages   = await fetch_outages(db, lat, lng, r_m)
         incidents = await fetch_incidents(db, lat, lng, r_m)
+        alert_zones = await fetch_alert_zones(db, lat, lng, r_m)
 
+        # derniers reports pour les badges / info
         q_rep = text(f"""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
@@ -384,6 +444,7 @@ async def map_endpoint(
         payload = {
             "outages": outages,
             "incidents": incidents,
+            "alert_zones": alert_zones,   # 👈 nouveau
             "last_reports": last_reports,
             "server_now": nowz(),
         }
@@ -400,10 +461,12 @@ async def map_endpoint(
         return {
             "outages": [],
             "incidents": [],
+            "alert_zones": [],
             "last_reports": [],
             "server_now": nowz(),
             "error": f"{type(e).__name__}: {e}",
         }
+
 
 
 # --------- POST /report ----------
@@ -1455,3 +1518,45 @@ async def admin_export_aggregated_csv(
     buf.seek(0)
     return StreamingResponse(buf, media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=aggregated.csv"})
+
+from fastapi import status
+
+class AckIn(BaseModel):
+    kind: str
+    lat: float
+    lng: float
+    responder: Optional[str] = "firefighter"
+
+@router.post("/responder/ack", status_code=status.HTTP_201_CREATED)
+async def responder_ack(
+    p: AckIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    token: Optional[str] = Query(None)
+):
+    # auth très simple: header x-admin-token OU token=? (RESPONDER_TOKEN)
+    ok = False
+    if ADMIN_TOKEN and request.headers.get("x-admin-token","").strip() == ADMIN_TOKEN:
+        ok = True
+    if not ok and RESPONDER_TOKEN and (token or "").strip() == RESPONDER_TOKEN:
+        ok = True
+    if not ok:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    K = (p.kind or "").strip().lower()
+    if K not in {"traffic","accident","fire","flood","power","water"}:
+        raise HTTPException(400, "invalid kind")
+
+    try:
+        await db.execute(
+            text("""
+              INSERT INTO responder_claims(kind, center, responder, created_at)
+              VALUES (:k, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography, :r, NOW())
+            """),
+            {"k": K, "lng": p.lng, "lat": p.lat, "r": (p.responder or "firefighter")}
+        )
+        await db.commit()
+        return {"ok": True}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(500, f"ack failed: {e}")
