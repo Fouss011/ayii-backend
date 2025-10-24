@@ -1566,3 +1566,151 @@ async def responder_ack(
     except Exception as e:
         await db.rollback()
         raise HTTPException(500, f"ack failed: {e}")
+    
+# ---------- ZONES D’ALERTE (lecture) ----------
+@router.get("/alert_zones")
+async def alert_zones(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    radius_km: float = Query(1.0, gt=0, le=50),
+    kind: Optional[str] = Query(None, description="filtrer: fire|accident|traffic|flood|power|water"),
+    threshold: int = Query(int(os.getenv("ALERT_MIN_REPORTS","3")), ge=2, le=20),
+    window_min: int = Query(int(os.getenv("ALERT_WINDOW_MIN","180")), ge=5, le=1440),
+    group_radius_m: int = Query(int(os.getenv("ALERT_RADIUS_M","100")), ge=50, le=1000),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Regroupe les reports 'cut' récents par proximité (DBSCAN) et renvoie les clusters
+    dont la taille >= threshold, sauf si un ACK (prise en charge) se trouve dans le même rayon.
+    """
+    if kind:
+        k = kind.strip().lower()
+        if k not in {"traffic","accident","fire","flood","power","water"}:
+            raise HTTPException(400, "invalid kind")
+    else:
+        k = None
+
+    r_m = float(radius_km) * 1000.0
+    # Zone d’intérêt autour (lat,lng)
+    # 1) On extrait les reports récents dans la zone
+    base_sql = f"""
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+        ), pts AS (
+          SELECT
+            id,
+            kind::text AS kind,
+            ST_SnapToGrid(ST_Transform((geom::geometry),3857), 1.0) AS g3857, -- aide perf
+            (geom::geometry) AS g4326,
+            created_at
+          FROM reports
+          WHERE created_at > NOW() - INTERVAL '{window_min} minutes'
+            AND LOWER(TRIM(signal::text)) = 'cut'
+            AND ST_DWithin((geom::geography), (SELECT g FROM me), :r)
+            { "AND kind = :k" if k else "" }
+        ),
+        clus AS (
+          SELECT
+            kind,
+            ST_ClusterDBSCAN(g3857, eps := :eps, minpoints := 2) OVER () AS cid,   -- eps en mètres (en 3857 ≈ mètres)
+            g4326
+          FROM pts
+        ),
+        agg AS (
+          SELECT
+            kind,
+            cid,
+            COUNT(*)::int AS n,
+            ST_Transform(ST_Centroid(ST_Collect(g4326)), 4326) AS center4326
+          FROM clus
+          WHERE cid IS NOT NULL
+          GROUP BY kind, cid
+        )
+        SELECT
+          a.kind,
+          a.n,
+          ST_Y(a.center4326) AS lat,
+          ST_X(a.center4326) AS lng
+        FROM agg a
+        WHERE a.n >= :threshold
+    """
+    # Exclure celles "prises en charge" (ack) à proximité
+    # si un ack de même kind existe dans group_radius_m → on filtre
+    sql = text(f"""
+        WITH zones AS (
+          {base_sql}
+        )
+        SELECT z.kind, z.n, z.lat, z.lng
+        FROM zones z
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM acks ak
+          WHERE ak.kind = z.kind
+            AND ST_DWithin(
+              (ST_SetSRID(ST_MakePoint(z.lng, z.lat),4326)::geography),
+              ak.geom,
+              :ack_r
+            )
+        )
+        ORDER BY z.kind, z.n DESC
+    """)
+
+    # eps pour DBSCAN (projection WebMercator en mètres ~ ok en milieu de carte)
+    params = {
+        "lat": lat, "lng": lng, "r": r_m,
+        "eps": float(group_radius_m),
+        "threshold": int(threshold),
+        "ack_r": float(group_radius_m),
+    }
+    if k:
+        params["k"] = k
+
+    try:
+        res = await db.execute(sql, params)
+        rows = res.fetchall()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(500, f"alert_zones failed: {e}")
+
+    return [
+        {"kind": r.kind, "count": int(r.n), "lat": float(r.lat), "lng": float(r.lng)}
+        for r in rows
+    ]
+
+
+# ---------- PRISE EN CHARGE POMPIER / ADMIN (écriture) ----------
+class AckIn(BaseModel):
+    kind: str
+    lat: float
+    lng: float
+    user_id: Optional[str] = None    # optionnel: pour traçabilité
+
+@router.post("/fire_ack")
+async def fire_ack(
+    p: AckIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    # simple auth pompier/admin via x-admin-token (même logique que /admin/*)
+    admin_hdr = (request.headers.get("x-admin-token") or "").strip()
+    tok = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
+    if not tok or admin_hdr != tok:
+        raise HTTPException(status_code=401, detail="invalid admin token")
+
+    k = (p.kind or "").strip().lower()
+    if k not in {"traffic","accident","fire","flood","power","water"}:
+        raise HTTPException(400, "invalid kind")
+
+    try:
+        await db.execute(text("""
+            INSERT INTO acks(kind, geom, user_id, created_at)
+            VALUES (:k, ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+                    NULLIF(:uid,'')::uuid, NOW())
+        """), {"k": k, "lng": p.lng, "lat": p.lat, "uid": (p.user_id or "")})
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(500, f"fire_ack failed: {e}")
+
+    return {"ok": True}
+
