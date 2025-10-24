@@ -3,26 +3,27 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
 
-from .config import STATIC_DIR, STATIC_URL_PATH
-
+from app.config import STATIC_DIR, STATIC_URL_PATH  # ← depuis app.config
 
 app = FastAPI()
 
-# CORS (mets ton domaine front en prod)
+# CORS (remplace "*" par l’URL de ton front en prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
-# Monter /static -> STATIC_DIR
+# Monter les fichiers statiques pour servir les images locales
 app.mount(STATIC_URL_PATH, StaticFiles(directory=STATIC_DIR), name="static")
 
-# (après le mount) inclure les routes API
-from app.routes.map import router as map_router
+# ⚠️ Important: importer le router APRÈS la config ci-dessus pour éviter les imports circulaires
+from app.routes.map import router as map_router  # noqa: E402
 app.include_router(map_router, prefix="/api")
+
 
 # -------------------------------------------------------------------
 # .env en local (pas sur Render/Prod)
