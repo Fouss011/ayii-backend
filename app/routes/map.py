@@ -111,7 +111,7 @@ async def _upload_to_supabase(file_bytes: bytes, filename: str, content_type: st
 
 # ---------- LECTURES (outages/incidents) ----------
 async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
-    q_full = text("""
+    q_full = text(f"""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
         )
@@ -122,7 +122,8 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
                ST_X((o.center::geometry)) AS lng,
                o.started_at,
                o.restored_at,
-               COALESCE(att.cnt, 0)::int AS attachments_count
+               COALESCE(att.cnt, 0)::int AS attachments_count,
+               COALESCE(rep.cnt, 0)::int AS reports_count
         FROM outages o
         LEFT JOIN LATERAL (
           SELECT COUNT(*)::int AS cnt
@@ -131,10 +132,18 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
              AND a.created_at > NOW() - INTERVAL '48 hours'
              AND ST_DWithin((a.geom::geography), (o.center::geography), 120)
         ) att ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS cnt
+            FROM reports r
+           WHERE LOWER(TRIM(r.signal::text))='cut'
+             AND r.created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
+             AND r.kind::text = o.kind::text
+             AND ST_DWithin((r.geom::geography), (o.center::geography), 120)
+        ) rep ON TRUE
         WHERE ST_DWithin((o.center::geography), (SELECT g FROM me), :r)
         ORDER BY o.started_at DESC NULLS LAST, o.id DESC
     """)
-    q_min = text("""
+    q_min = text(f"""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
         )
@@ -145,7 +154,8 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
                ST_X((o.center::geometry)) AS lng,
                o.started_at,
                o.restored_at,
-               0::int AS attachments_count
+               0::int AS attachments_count,
+               0::int AS reports_count
         FROM outages o
         WHERE ST_DWithin((o.center::geography), (SELECT g FROM me), :r)
         ORDER BY o.started_at DESC NULLS LAST, o.id DESC
@@ -158,20 +168,17 @@ async def fetch_outages(db: AsyncSession, lat: float, lng: float, r_m: float):
     rows = res.fetchall()
     return [
         {
-            "id": r.id,
-            "kind": r.kind,
-            "status": r.status,
-            "lat": float(r.lat),
-            "lng": float(r.lng),
+            "id": r.id, "kind": r.kind, "status": r.status,
+            "lat": float(r.lat), "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
             "attachments_count": getattr(r, "attachments_count", 0),
-        }
-        for r in rows
+            "reports_count": getattr(r, "reports_count", 0),
+        } for r in rows
     ]
 
 async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
-    q_full = text("""
+    q_full = text(f"""
         WITH me AS (
           SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
         )
@@ -182,7 +189,8 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
                ST_X((i.center::geometry)) AS lng,
                i.started_at,
                i.restored_at,
-               COALESCE(att.cnt, 0)::int AS attachments_count
+               COALESCE(att.cnt, 0)::int AS attachments_count,
+               COALESCE(rep.cnt, 0)::int AS reports_count
         FROM incidents i
         LEFT JOIN LATERAL (
           SELECT COUNT(*)::int AS cnt
@@ -191,6 +199,14 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
              AND a.created_at > NOW() - INTERVAL '48 hours'
              AND ST_DWithin((a.geom::geography), (i.center::geography), 120)
         ) att ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS cnt
+            FROM reports r
+           WHERE LOWER(TRIM(r.signal::text))='cut'
+             AND r.created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
+             AND r.kind::text = i.kind::text
+             AND ST_DWithin((r.geom::geography), (i.center::geography), 120)
+        ) rep ON TRUE
         WHERE ST_DWithin((i.center::geography), (SELECT g FROM me), :r)
         ORDER BY i.started_at DESC NULLS LAST, i.id DESC
     """)
@@ -205,7 +221,8 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
                ST_X((i.center::geometry)) AS lng,
                i.started_at,
                i.restored_at,
-               0::int AS attachments_count
+               0::int AS attachments_count,
+               0::int AS reports_count
         FROM incidents i
         WHERE ST_DWithin((i.center::geography), (SELECT g FROM me), :r)
         ORDER BY i.started_at DESC NULLS LAST, i.id DESC
@@ -218,21 +235,18 @@ async def fetch_incidents(db: AsyncSession, lat: float, lng: float, r_m: float):
     rows = res.fetchall()
     return [
         {
-            "id": r.id,
-            "kind": r.kind,
-            "status": r.status,
-            "lat": float(r.lat),
-            "lng": float(r.lng),
+            "id": r.id, "kind": r.kind, "status": r.status,
+            "lat": float(r.lat), "lng": float(r.lng),
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
             "attachments_count": getattr(r, "attachments_count", 0),
-        }
-        for r in rows
+            "reports_count": getattr(r, "reports_count", 0),
+        } for r in rows
     ]
 
-# ---------- LECTURES GLOBAL (ignorer le centre/rayon) ----------
+# ---------- LECTURES GLOBAL (show_all) ----------
 async def fetch_outages_all(db: AsyncSession, limit: int = 2000):
-    q = text("""
+    q = text(f"""
         SELECT o.id,
                o.kind::text AS kind,
                CASE WHEN o.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
@@ -240,7 +254,8 @@ async def fetch_outages_all(db: AsyncSession, limit: int = 2000):
                ST_X((o.center::geometry)) AS lng,
                o.started_at,
                o.restored_at,
-               COALESCE(att.cnt, 0)::int AS attachments_count
+               COALESCE(att.cnt, 0)::int AS attachments_count,
+               COALESCE(rep.cnt, 0)::int AS reports_count
         FROM outages o
         LEFT JOIN LATERAL (
           SELECT COUNT(*)::int AS cnt
@@ -249,6 +264,14 @@ async def fetch_outages_all(db: AsyncSession, limit: int = 2000):
              AND a.created_at > NOW() - INTERVAL '48 hours'
              AND ST_DWithin((a.geom::geography), (o.center::geography), 120)
         ) att ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS cnt
+            FROM reports r
+           WHERE LOWER(TRIM(r.signal::text))='cut'
+             AND r.created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
+             AND r.kind::text = o.kind::text
+             AND ST_DWithin((r.geom::geography), (o.center::geography), 120)
+        ) rep ON TRUE
         WHERE o.restored_at IS NULL
         ORDER BY o.started_at DESC NULLS LAST, o.id DESC
         LIMIT :lim
@@ -262,11 +285,12 @@ async def fetch_outages_all(db: AsyncSession, limit: int = 2000):
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
             "attachments_count": getattr(r, "attachments_count", 0),
+            "reports_count": getattr(r, "reports_count", 0),
         } for r in rows
     ]
 
 async def fetch_incidents_all(db: AsyncSession, limit: int = 2000):
-    q = text("""
+    q = text(f"""
         SELECT i.id,
                i.kind::text AS kind,
                CASE WHEN i.restored_at IS NULL THEN 'active' ELSE 'restored' END AS status,
@@ -274,7 +298,8 @@ async def fetch_incidents_all(db: AsyncSession, limit: int = 2000):
                ST_X((i.center::geometry)) AS lng,
                i.started_at,
                i.restored_at,
-               COALESCE(att.cnt, 0)::int AS attachments_count
+               COALESCE(att.cnt, 0)::int AS attachments_count,
+               COALESCE(rep.cnt, 0)::int AS reports_count
         FROM incidents i
         LEFT JOIN LATERAL (
           SELECT COUNT(*)::int AS cnt
@@ -283,6 +308,14 @@ async def fetch_incidents_all(db: AsyncSession, limit: int = 2000):
              AND a.created_at > NOW() - INTERVAL '48 hours'
              AND ST_DWithin((a.geom::geography), (i.center::geography), 120)
         ) att ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS cnt
+            FROM reports r
+           WHERE LOWER(TRIM(r.signal::text))='cut'
+             AND r.created_at > NOW() - INTERVAL '{POINTS_WINDOW_MIN} minutes'
+             AND r.kind::text = i.kind::text
+             AND ST_DWithin((r.geom::geography), (i.center::geography), 120)
+        ) rep ON TRUE
         WHERE i.restored_at IS NULL
         ORDER BY i.started_at DESC NULLS LAST, i.id DESC
         LIMIT :lim
@@ -296,60 +329,10 @@ async def fetch_incidents_all(db: AsyncSession, limit: int = 2000):
             "started_at": getattr(r, "started_at", None),
             "restored_at": getattr(r, "restored_at", None),
             "attachments_count": getattr(r, "attachments_count", 0),
+            "reports_count": getattr(r, "reports_count", 0),
         } for r in rows
     ]
 
-async def fetch_alert_zones(db: AsyncSession, lat: float, lng: float, r_m: float):
-    """
-    Regroupe les reports 'cut' récents (ALERT_WINDOW_H) dans des cellules ~100m,
-    et ne renvoie que celles dont le compteur >= ALERT_THRESHOLD,
-    en retirant celles 'prises en charge' (responder_claims) à proximité.
-    """
-    # bin ~ 0.001° ~ 111m
-    q = text(f"""
-        WITH me AS (
-          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-        ),
-        recent AS (
-          SELECT
-            LOWER(TRIM(kind::text)) AS kind,
-            ROUND(CAST(ST_Y(geom::geometry) AS numeric), 3) AS lat_bin,
-            ROUND(CAST(ST_X(geom::geometry) AS numeric), 3) AS lng_bin,
-            AVG(ST_Y(geom::geometry)) AS lat,
-            AVG(ST_X(geom::geometry)) AS lng,
-            COUNT(*)::int AS n
-          FROM reports
-          WHERE LOWER(TRIM(signal::text))='cut'
-            AND created_at > NOW() - INTERVAL '{ALERT_WINDOW_H} hours'
-            AND ST_DWithin((geom::geography), (SELECT g FROM me), :r)
-          GROUP BY 1,2,3
-        ),
-        with_claim AS (
-          SELECT r.kind, r.lat, r.lng, r.n,
-                 EXISTS (
-                   SELECT 1 FROM responder_claims c
-                   WHERE c.kind = r.kind
-                     AND ST_DWithin(
-                       ST_SetSRID(ST_MakePoint(r.lng, r.lat),4326)::geography,
-                       c.center, :ack_r
-                     )
-                 ) AS acknowledged
-          FROM recent r
-        )
-        SELECT kind, lat::float, lng::float, n::int, acknowledged
-        FROM with_claim
-        WHERE n >= :th
-        ORDER BY n DESC, kind ASC
-        LIMIT 500
-    """)
-    res = await db.execute(q, {"lng": lng, "lat": lat, "r": r_m, "th": ALERT_THRESHOLD, "ack_r": max(ALERT_RADIUS_M, 120)})
-    rows = res.fetchall()
-    return [
-        {"kind": r.kind, "lat": float(r.lat), "lng": float(r.lng),
-         "radius_m": ALERT_RADIUS_M, "count": int(r.n), "acknowledged": bool(r.acknowledged)}
-        for r in rows
-        if not bool(r.acknowledged)  # on masque celles déjà prises en charge
-    ]
 
 
 # ---------- ENDPOINT /map ----------
