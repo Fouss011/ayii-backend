@@ -18,9 +18,7 @@ from app.config import STATIC_DIR, STATIC_URL_PATH           # constants (pas d'
 from app.db import get_db                                   # async session factory
 from app.services.aggregation import run_aggregation        # ta tâche d’agrégation
 
-from app.routes.admin_cta import router as cta_router
-app.include_router(cta_router)
-
+# ⚠️ NE PAS inclure de router ici (app pas encore créée)
 
 # -----------------------------------------------------------------------------
 # Chargement .env en local (pas sur Render/Prod)
@@ -169,13 +167,27 @@ async def no_store_cache(request: Request, call_next):
 # -----------------------------------------------------------------------------
 # Routes (IMPORTER APRÈS la config ci-dessus)
 # -----------------------------------------------------------------------------
-from app.routes.map import router as map_router   # noqa: E402
+from app.routes.map import router as map_router         # noqa: E402
 app.include_router(map_router)
+
+# Route de report (si séparée)
+try:
+    from app.routes.report_simple import router as report_router  # noqa: E402
+    app.include_router(report_router)
+except Exception:
+    pass
+
+# CTA séparé (protégé par x-admin-token) — ⚠️ inclure après app = FastAPI(...)
+try:
+    from app.routes.admin_cta import router as cta_router         # noqa: E402
+    app.include_router(cta_router)
+except Exception:
+    pass
 
 # /dev/* uniquement en dev
 try:
     if os.getenv("ENV", "dev") == "dev":
-        from app.routes.dev import router as dev_router  # noqa: E402
+        from app.routes.dev import router as dev_router            # noqa: E402
         app.include_router(dev_router)
 except Exception:
     pass
