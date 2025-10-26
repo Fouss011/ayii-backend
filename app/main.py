@@ -167,15 +167,32 @@ except Exception:
     pass
 
 # CTA (protégé par x-admin-token)
+# CTA (protégé par x-admin-token) — inclure après app = FastAPI(...)
 try:
-    from app.routes.admin_cta import router as cta_router         # noqa: E402
-    app.include_router(cta_router)
-except Exception:
-    pass
+    from app.routes import admin_cta as _admin_cta_mod  # importe le module entier (meilleur pour logs)
+    app.include_router(_admin_cta_mod.router)
+    print("[routes] admin_cta mounted at /cta")
+except Exception as e:
+    print(f"[routes] admin_cta NOT mounted: {e}")
+
 
 # 👉 Dashboard CTA (AJOUT ICI, APRÈS app = FastAPI(...))
 from app.routes.dashboard import router as dashboard_router       # noqa: E402
 app.include_router(dashboard_router)
+
+# Metrics API
+try:
+    from app.routes.metrics import router as metrics_router     # noqa: E402
+    app.include_router(metrics_router)
+except Exception as e:
+    print(f"[routes] metrics NOT mounted: {e}")
+
+# Dashboard Pro (metrics + tableau)
+try:
+    from app.routes.dashboard_pro import router as dashboard_pro_router  # noqa: E402
+    app.include_router(dashboard_pro_router)
+except Exception as e:
+    print(f"[routes] dashboard_pro NOT mounted: {e}")
 
 # Optionnels si présents
 for opt in ("reverse", "outages"):
