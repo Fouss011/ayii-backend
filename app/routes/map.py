@@ -333,6 +333,97 @@ async def fetch_incidents_all(db: AsyncSession, limit: int = 2000):
         } for r in rows
     ]
 
+# --- Helper pour /map : zones d’alerte via cluster DBSCAN ---
+async def fetch_alert_zones(db: AsyncSession, lat: float, lng: float, r_m: float):
+    """
+    Regroupe les reports 'cut' récents par proximité (DBSCAN-like) et renvoie
+    des clusters {kind, count, lat, lng} prêts pour la carte.
+    Utilise les constantes : ALERT_RADIUS_M, ALERT_WINDOW_H, ALERT_THRESHOLD.
+    Exclut les zones où un ack (prise en charge) existe à proximité.
+    """
+    window_min = int(ALERT_WINDOW_H) * 60  # passer heures -> minutes
+    group_radius_m = float(ALERT_RADIUS_M)
+    threshold = int(ALERT_THRESHOLD)
+
+    sql = text(f"""
+        WITH me AS (
+          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+        ),
+        pts AS (
+          SELECT
+            id,
+            kind::text AS kind,
+            ST_SnapToGrid(ST_Transform((geom::geometry),3857), 1.0) AS g3857,
+            (geom::geometry) AS g4326
+          FROM reports
+          WHERE created_at > NOW() - INTERVAL '{window_min} minutes'
+            AND LOWER(TRIM(signal::text))='cut'
+            AND ST_DWithin((geom::geography), (SELECT g FROM me), :r)
+        ),
+        clus AS (
+          SELECT
+            kind,
+            ST_ClusterDBSCAN(g3857, eps := :eps, minpoints := 2) OVER () AS cid,
+            g4326
+          FROM pts
+        ),
+        agg AS (
+          SELECT
+            kind,
+            cid,
+            COUNT(*)::int AS n,
+            ST_Transform(ST_Centroid(ST_Collect(g4326)), 4326) AS center4326
+          FROM clus
+          WHERE cid IS NOT NULL
+          GROUP BY kind, cid
+        ),
+        zones AS (
+          SELECT
+            a.kind,
+            a.n,
+            ST_Y(a.center4326) AS lat,
+            ST_X(a.center4326) AS lng
+          FROM agg a
+          WHERE a.n >= :threshold
+        )
+        SELECT z.kind, z.n, z.lat, z.lng
+        FROM zones z
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM acks ak
+          WHERE ak.kind = z.kind
+            AND ST_DWithin(
+              (ST_SetSRID(ST_MakePoint(z.lng, z.lat),4326)::geography),
+              ak.geom,
+              :ack_r
+            )
+        )
+        ORDER BY z.kind, z.n DESC
+    """)
+
+    params = {
+        "lat": float(lat),
+        "lng": float(lng),
+        "r":   float(r_m),
+        "eps": group_radius_m,
+        "threshold": threshold,
+        "ack_r": group_radius_m,
+    }
+
+    try:
+        res = await db.execute(sql, params)
+        rows = res.fetchall()
+    except Exception as e:
+        # Reste robuste : en cas d'erreur SQL, renvoie zéro zone
+        await db.rollback()
+        return []
+
+    return [
+        {"kind": r.kind, "count": int(r.n), "lat": float(r.lat), "lng": float(r.lng)}
+        for r in rows
+    ]
+
+
 
 
 # ---------- ENDPOINT /map ----------
