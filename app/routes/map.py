@@ -551,6 +551,9 @@ class ReportIn(BaseModel):
     lng: float
     user_id: Optional[str] = None
     idempotency_key: Optional[str] = None
+    photo_url: Optional[str] = None      # ✅ pris en charge
+    device_id: Optional[str] = None      # ✅ pris en charge
+    accuracy_m: Optional[int] = None     # ✅ pris en charge
 
 @router.post("/report")
 async def post_report(
@@ -586,49 +589,97 @@ async def post_report(
         except Exception:
             await db.rollback()
 
-    # 1) Enregistrer le report (idempotent)
+    # 1) Enregistrer le report (idempotent) + métadonnées (photo_url, device_id, accuracy_m)
     inserted_id = None
     try:
         res = await db.execute(text("""
-            INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
+            INSERT INTO reports(
+              kind, signal, geom, user_id, created_at, idempotency_key,
+              photo_url, device_id, accuracy_m
+            )
             SELECT
               CAST(:kind   AS report_kind),
               CAST(:signal AS report_signal),
               ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
               CAST(NULLIF(:uid,'') AS uuid),
               NOW(),
-              NULLIF(:idem,'')::text
+              NULLIF(:idem,'')::text,
+              NULLIF(:photo_url,'')::text,
+              NULLIF(:device_id,'')::text,
+              CAST(NULLIF(:accuracy_m,'') AS integer)
             WHERE
               (:idem IS NULL OR :idem = '')
               OR NOT EXISTS (SELECT 1 FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text)
             RETURNING id
-        """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": (uid or ""), "idem": idem})
+        """), {
+            "kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat,
+            "uid": (uid or ""), "idem": idem,
+            "photo_url": p.photo_url or "",
+            "device_id": p.device_id or "",
+            "accuracy_m": p.accuracy_m
+        })
         row = res.fetchone()
         await db.commit()
         inserted_id = row[0] if row else None
     except Exception:
         await db.rollback()
         try:
+            # Fallback si types enum absents : cast en text
             res = await db.execute(text("""
-                INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
+                INSERT INTO reports(
+                  kind, signal, geom, user_id, created_at, idempotency_key,
+                  photo_url, device_id, accuracy_m
+                )
                 SELECT
                   CAST(:kind   AS text),
                   CAST(:signal AS text),
                   ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
                   CAST(NULLIF(:uid,'') AS uuid),
                   NOW(),
-                  NULLIF(:idem,'')::text
+                  NULLIF(:idem,'')::text,
+                  NULLIF(:photo_url,'')::text,
+                  NULLIF(:device_id,'')::text,
+                  CAST(NULLIF(:accuracy_m,'') AS integer)
                 WHERE
                   (:idem IS NULL OR :idem = '')
                   OR NOT EXISTS (SELECT 1 FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text)
                 RETURNING id
-            """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": (uid or ""), "idem": idem})
+            """), {
+                "kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat,
+                "uid": (uid or ""), "idem": idem,
+                "photo_url": p.photo_url or "",
+                "device_id": p.device_id or "",
+                "accuracy_m": p.accuracy_m
+            })
             row = res.fetchone()
             await db.commit()
             inserted_id = row[0] if row else None
         except Exception as e2:
             await db.rollback()
             raise HTTPException(500, f"report insert failed: {e2}")
+
+    # 1b) Signature HMAC + journal 'created' (best-effort)
+    try:
+        from app.services.report_hooks import enrich_and_sign_report
+        if inserted_id:
+            await enrich_and_sign_report(
+                db, str(inserted_id),
+                kind=kind, signal=signal, lat=p.lat, lng=p.lng,
+                device_id=p.device_id, accuracy_m=p.accuracy_m,
+                photo_url=p.photo_url, user_id=uid
+            )
+        # journal 'created'
+        try:
+            await db.execute(
+                text("INSERT INTO report_events (report_id, event) VALUES (CAST(:rid AS uuid), 'created')"),
+                {"rid": str(inserted_id)}
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+    except Exception:
+        # on ne bloque pas la création si la signature ou le log échouent
+        pass
 
     # 2) Mise à jour incidents/outages (vérité carte)
     try:
@@ -736,6 +787,7 @@ async def post_report(
         raise HTTPException(500, f"events update failed: {e}")
 
     return {"ok": True, "id": inserted_id, "idempotency_key": idem}
+
 
 # --------- Admin: factory reset ----------
 @router.post("/admin/factory_reset")
