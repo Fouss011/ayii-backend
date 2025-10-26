@@ -786,7 +786,7 @@ async def upload_image(
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
-    # --- sécurité admin simple
+    # --- sécurité admin simple (on garde ta logique)
     is_admin = False
     try:
         admin_hdr = (request.headers.get("x-admin-token") or "").strip()
@@ -805,14 +805,21 @@ async def upload_image(
         raise HTTPException(status_code=400, detail="file too large or empty")
 
     # idempotency
-    if idempotency_key:
+    idem = (idempotency_key or "").strip() or None
+    if idem:
         q = text("SELECT id, url FROM attachments WHERE idempotency_key = :k LIMIT 1")
-        rs = await db.execute(q, {"k": idempotency_key})
+        rs = await db.execute(q, {"k": idem})
         row = rs.first()
         if row:
-            return {"ok": True, "id": str(row.id), "url": row.url, "idempotency_key": idempotency_key}
+            return {
+                "ok": True,
+                "id": str(row.id),
+                # Ne renvoyer l’URL qu’aux admins (privacy)
+                "url": row.url if is_admin else None,
+                "idempotency_key": idem
+            }
 
-    # --- Ownership check si pas admin
+    # --- Ownership check si pas admin (on garde ta règle)
     if not is_admin:
         if not user_id:
             raise HTTPException(status_code=403, detail="not_owner")
@@ -831,14 +838,15 @@ async def upload_image(
         if rs.first() is None:
             raise HTTPException(status_code=403, detail="not_owner")
 
-    # --- stockage (Supabase si config, sinon local)
+    # --- stockage (Supabase si config, sinon local) — on garde ta base, avec 2 petites améliorations
     url_public = None
     try:
-        bucket = os.getenv("SUPABASE_BUCKET", "attachments")  # <-- bucket correct
+        bucket = os.getenv("SUPABASE_BUCKET", "attachments")
         filename = f"{K}_{uuid.uuid4()}.jpg"
 
         supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
-        supa_key = os.getenv("SUPABASE_SERVICE_ROLE")  # <-- utilise la clé service rôle
+        # compat: SERVICE_ROLE ou SERVICE_KEY
+        supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
 
         if supa_url and supa_key:
             # Upload direct via API HTTP (léger et fiable en prod)
@@ -854,6 +862,7 @@ async def upload_image(
                 r = await client.post(upload_url, headers=headers, content=data)
                 if r.status_code not in (200, 201):
                     raise HTTPException(500, f"supabase upload failed [{r.status_code}]: {r.text}")
+            # URL publique (bucket public). Si bucket privé, on passera aux URLs signées plus tard.
             url_public = f"{supa_url}/storage/v1/object/public/{bucket}/{path}"
         else:
             # Fallback local (/static) — utile en dev local seulement
@@ -875,27 +884,47 @@ async def upload_image(
     if not url_public:
         raise HTTPException(status_code=500, detail="no_public_url")
 
-    # --- insert DB
+    # --- insert DB (GEOGRAPHY + flags privacy) — petites améliorations
     ins = text("""
-      INSERT INTO attachments (kind, geom, user_id, url, idempotency_key, created_at)
+      INSERT INTO attachments (
+        kind, geom, user_id, url, idempotency_key, created_at,
+        is_sensitive, uploader_id
+      )
       VALUES (
         :k,
-        ST_SetSRID(ST_MakePoint(:lng,:lat),4326),
+        ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
         :uid,
         :url,
         :idem,
-        NOW()
+        NOW(),
+        TRUE,                         -- par défaut sensible (privacy first)
+        :uploader
       )
       RETURNING id
     """)
     rs = await db.execute(
         ins,
-        {"k": K, "lng": lng, "lat": lat, "uid": str(user_id) if user_id else None, "url": url_public, "idem": idempotency_key},
+        {
+            "k": K,
+            "lng": float(lng),
+            "lat": float(lat),
+            "uid": str(user_id) if user_id else None,
+            "url": url_public,
+            "idem": idem,
+            "uploader": str(user_id) if user_id else None
+        },
     )
     row = rs.first()
     await db.commit()
 
-    return {"ok": True, "id": str(row.id), "url": url_public, "idempotency_key": idempotency_key}
+    return {
+        "ok": True,
+        "id": str(row.id),
+        # on ne renvoie l'URL qu'aux admins (évite fuite publique)
+        "url": url_public if is_admin else None,
+        "idempotency_key": idem
+    }
+
 
 
 
@@ -1438,20 +1467,23 @@ async def attachments_near(
     lng: float = Query(..., ge=-180, le=180),
     radius_m: int = Query(150, ge=10, le=2000),
     hours: int = Query(48, ge=1, le=168),
+    request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
     k = (kind or "").strip().lower()
     if k not in {"traffic","accident","fire","flood","power","water"}:
         raise HTTPException(status_code=400, detail="invalid kind")
 
+    # admin ?
+    tok = (request.headers.get("x-admin-token") or "").strip()
+    is_admin = bool(ADMIN_TOKEN and tok == ADMIN_TOKEN)
+
     sql = text(f"""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-        SELECT id,
-               url,
+        SELECT id, url,
                ST_Y((geom::geometry)) AS lat,
                ST_X((geom::geometry)) AS lng,
-               user_id,
-               created_at
+               uploader_id, created_at, is_sensitive
           FROM attachments
          WHERE kind = :kind
            AND created_at > NOW() - INTERVAL '{hours} hours'
@@ -1461,17 +1493,26 @@ async def attachments_near(
     """)
     rs = await db.execute(sql, {"kind": k, "lng": lng, "lat": lat, "r": radius_m})
     rows = rs.fetchall()
-    return [
-        {
+
+    out = []
+    for r in rows:
+        d = {
             "id": r.id,
-            "url": r.url,
             "lat": float(r.lat),
             "lng": float(r.lng),
-            "user_id": r.user_id,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
-        for r in rows
-    ]
+        if is_admin:
+            d["url"] = r.url
+            d["is_sensitive"] = bool(r.is_sensitive)
+            d["uploader_id"] = r.uploader_id
+        else:
+            # Public : pas d’URL. Message neutre.
+            d["url"] = None
+            d["note"] = "📷 Image réservée aux secours"
+        out.append(d)
+
+    return out
 
 
 # --- Agrégations CSV (reports/events) ---
