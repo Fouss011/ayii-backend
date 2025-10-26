@@ -18,6 +18,10 @@ from app.config import STATIC_DIR, STATIC_URL_PATH           # constants (pas d'
 from app.db import get_db                                   # async session factory
 from app.services.aggregation import run_aggregation        # ta tâche d’agrégation
 
+from app.routes.admin_cta import router as cta_router
+app.include_router(cta_router)
+
+
 # -----------------------------------------------------------------------------
 # Chargement .env en local (pas sur Render/Prod)
 # -----------------------------------------------------------------------------

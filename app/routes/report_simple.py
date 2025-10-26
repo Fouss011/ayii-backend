@@ -4,6 +4,7 @@ import json
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text  # pour journaliser l'événement "created"
 
 # === Adapte ces imports à ton projet si besoin ===
 try:
@@ -24,6 +25,9 @@ for path in ("app.services.reports", "app.core.reports", "app.db.reports", "app.
 if _insert_report is None:
     raise RuntimeError("Impossible d'importer insert_report. Corrige l'import ci-dessus.")
 insert_report = _insert_report
+
+# Hook d'intégrité (signature HMAC) après insertion
+from app.services.report_hooks import enrich_and_sign_report
 
 # Essaie d'utiliser ton modèle ReportIn ; sinon, fallback Pydantic
 ReportIn = None
@@ -49,6 +53,7 @@ if ReportIn is None:
         note: Optional[str] = Field(default=None)
         photo_url: Optional[str] = Field(default=None)
         user_id: Optional[str] = Field(default=None)
+        device_id: Optional[str] = Field(default=None)         # ✅ ajouté
         idempotency_key: Optional[str] = Field(default=None)
 
 router = APIRouter()
@@ -66,7 +71,7 @@ def _deep_unwrap_json_string(value: Any) -> Any:
         v = value
         while isinstance(v, str):
             t = v.strip()
-            if t.startswith("{") or t.startswith("[" ):
+            if t.startswith("{") or t.startswith("["):
                 v = json.loads(v)
             else:
                 break
@@ -78,8 +83,8 @@ def _deep_unwrap_json_string(value: Any) -> Any:
 @router.post("/report")
 async def create_report(payload: Any = Body(...), db: AsyncSession = Depends(get_db)):
     """
-    Hotfix: accepte un body JSON objet **ou** une chaîne JSON (même double/triple stringifié).
-    Revalide via ReportIn puis exécute insert_report(...).
+    Accepte un body JSON objet **ou** une chaîne JSON (même double/triple stringifié).
+    Valide via ReportIn puis appelle insert_report(...), signe le report (HMAC) et journalise l'événement.
     """
     # 1) Déshabille si c'est une string
     payload = _deep_unwrap_json_string(payload)
@@ -88,7 +93,7 @@ async def create_report(payload: Any = Body(...), db: AsyncSession = Depends(get
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="Input should be a valid JSON object")
 
-    # 3) Validation Pydantic
+    # 3) Validation Pydantic (v2 puis fallback v1)
     try:
         data = ReportIn.model_validate(payload)  # Pydantic v2
     except AttributeError:
@@ -99,7 +104,7 @@ async def create_report(payload: Any = Body(...), db: AsyncSession = Depends(get
     kind = _normalize_enum_or_str(getattr(data, "kind", None))
     signal = _normalize_enum_or_str(getattr(data, "signal", None))
 
-    # 4) Logique métier (ta fonction existante)
+    # 4) Insertion + signature + journal "created"
     try:
         rid = await insert_report(
             db,
@@ -112,9 +117,34 @@ async def create_report(payload: Any = Body(...), db: AsyncSession = Depends(get
             photo_url=getattr(data, "photo_url", None),
             user_id=getattr(data, "user_id", None),
             idempotency_key=getattr(data, "idempotency_key", None),
+            device_id=getattr(data, "device_id", None),  # ✅ passe device_id si ton insert le supporte
         )
+
+        # 4b) Signature HMAC (intégrité)
+        await enrich_and_sign_report(
+            db, rid,
+            kind=kind, signal=signal,
+            lat=float(getattr(data, "lat")), lng=float(getattr(data, "lng")),
+            device_id=getattr(data, "device_id", None),
+            accuracy_m=int(getattr(data, "accuracy_m", 0)) if getattr(data, "accuracy_m", None) is not None else None,
+            photo_url=getattr(data, "photo_url", None),
+            user_id=getattr(data, "user_id", None),
+        )
+
+        # 4c) Journaliser l'événement "created"
+        await db.execute(
+            text("INSERT INTO report_events (report_id, event) VALUES (CAST(:rid AS uuid), 'created')"),
+            {"rid": rid},
+        )
+        await db.commit()
+
         return {"ok": True, "id": rid, "idempotency_key": getattr(data, "idempotency_key", None)}
     except HTTPException:
         raise
     except Exception as e:
+        # rollback soft si erreur en cours de route
+        try:
+            await db.rollback()
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail=str(e))
