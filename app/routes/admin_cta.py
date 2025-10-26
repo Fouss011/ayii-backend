@@ -5,11 +5,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from typing import Optional
 
-# Ton projet doit exposer get_db (déjà présent chez toi)
+# ✅ Import tolérant de get_db (dependencies -> db)
 try:
-    from app.dependencies import get_db
-except Exception as e:
-    raise RuntimeError("Besoin de app.dependencies.get_db") from e
+    from app.dependencies import get_db  # si tu as ce module
+except Exception:
+    try:
+        from app.db import get_db  # ✅ fallback vers app.db.get_db (ton cas)
+    except Exception as e:
+        raise RuntimeError("Impossible d'importer get_db (ni app.dependencies.get_db, ni app.db.get_db).") from e
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN") or "change-me"
 
@@ -42,7 +45,7 @@ async def list_incidents(
     params["limit"] = limit
     rows = (await db.execute(q, params)).mappings().all()
 
-    # âge en minutes (pour affichage "il y a X min")
+    # âge en minutes (pour "il y a X min")
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     out = []

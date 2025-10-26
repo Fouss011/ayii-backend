@@ -6,11 +6,15 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text  # pour journaliser l'événement "created"
 
-# === Adapte ces imports à ton projet si besoin ===
+# === Import get_db, tolérant ===
 try:
     from app.dependencies import get_db
-except Exception as e:
-    raise RuntimeError("Impossible d'importer get_db depuis app.dependencies. Adapte l'import.") from e
+except Exception:
+    try:
+        from app.db import get_db
+    except Exception as e:
+        raise RuntimeError("Impossible d'importer get_db (ni app.dependencies.get_db, ni app.db.get_db).") from e
+
 
 # Cherche insert_report dans les modules probables
 _insert_report = None
