@@ -41,7 +41,7 @@ async def _supabase_sign_url(public_or_path: str, expires_sec: int = 120) -> str
         signedURL = data.get("signedURL") or data.get("signedUrl")
         if not signedURL:
             return None
-        return f"{supa_url}/storage/v1/{signedURL}"
+        return (f"{supa_url}/storage/v1/{signedURL}").replace("/storage/v1//", "/storage/v1/")
     except Exception:
         return None
 
@@ -148,7 +148,7 @@ async def list_incidents(
             return url
         try:
             # _supabase_sign_url doit être définie (ou importée) ailleurs
-            signed = await _supabase_sign_url(url, expires_sec=120)  # type: ignore[name-defined]
+            signed = await _supabase_sign_url(url, expires_sec=300)  # type: ignore[name-defined]
             return signed or url
         except Exception:
             return url
