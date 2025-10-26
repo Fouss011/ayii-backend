@@ -16,19 +16,15 @@ from app.config import BASE_PUBLIC_URL, STATIC_DIR, STATIC_URL_PATH  # constants
 
 router = APIRouter()
 
-async def _supabase_sign_url(public_or_path: str, expires_sec: int = 120) -> str | None:
-    """
-    Accepte soit une URL '.../object/public/<bucket>/<path>', soit un '<bucket>/<path>' ou juste '<path>'.
-    Retourne une URL signée (expire) ou None si erreur/config manquante.
-    """
+async def _supabase_sign_url(public_or_path: str, expires_sec: int = 300) -> str | None:
+    import os
     supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
     supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
     bucket = os.getenv("SUPABASE_BUCKET", "attachments")
     if not (supa_url and supa_key):
         return None
 
-    # Déduire "<bucket>/<path>"
-    after = None
+    # -> "<bucket>/<path>"
     if "/storage/v1/object/public/" in public_or_path:
         try:
             after = public_or_path.split("/storage/v1/object/public/")[1]
@@ -52,9 +48,24 @@ async def _supabase_sign_url(public_or_path: str, expires_sec: int = 120) -> str
         signedURL = data.get("signedURL") or data.get("signedUrl")
         if not signedURL:
             return None
-        return f"{supa_url}/storage/v1/{signedURL}"
+        # normalisation anti "//"
+        return (f"{supa_url}/storage/v1/{signedURL}").replace("/storage/v1//", "/storage/v1/")
     except Exception:
         return None
+
+import time
+_signed_cache: dict[str, tuple[float, str]] = {}  # url -> (expires_at, signed_url)
+
+async def get_signed_cached(url: str, cache_ttl: int = 60, link_ttl_sec: int = 300) -> str | None:
+    now = time.time()
+    cached = _signed_cache.get(url)
+    if cached and now < cached[0]:
+        return cached[1]
+    signed = await _supabase_sign_url(url, expires_sec=link_ttl_sec)
+    if signed:
+        _signed_cache[url] = (now + cache_ttl, signed)
+    return signed
+
 
 
 # --------- Config ----------
@@ -1545,7 +1556,7 @@ async def attachments_near(
         }
         if is_admin:
             # ➜ signer l’URL (expire après 120 s). Si échec, on garde l’URL telle quelle.
-            signed = await _supabase_sign_url(r.url, expires_sec=120) if getattr(r, "url", None) else None
+            signed = await get_signed_cached(r.url) if getattr(r, "url", None) else None
             d["url"] = signed or r.url
             d["is_sensitive"] = bool(r.is_sensitive)
             d["uploader_id"] = r.uploader_id
