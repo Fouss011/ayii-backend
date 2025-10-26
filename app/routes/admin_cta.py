@@ -220,3 +220,72 @@ async def do_cleanup(
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"cleanup error: {e}")
+
+# app/routes/admin_cta.py (complément)
+from typing import Optional
+from uuid import UUID
+from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+import os
+
+from app.db import get_db
+
+router = APIRouter(prefix="/cta", tags=["CTA"])
+
+# ---- simple auth admin par x-admin-token ----
+def _admin_token() -> str:
+    return (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
+
+async def require_admin(request: Request) -> bool:
+    tok = _admin_token()
+    if not tok:
+        raise HTTPException(status_code=401, detail="admin token not configured")
+    hdr = (request.headers.get("x-admin-token") or "").strip()
+    if hdr != tok:
+        raise HTTPException(status_code=401, detail="invalid admin token")
+    return True
+
+# ---- payload ----
+class MarkStatusIn(BaseModel):
+    id: UUID | str
+    status: str  # 'new'|'confirmed'|'resolved'
+
+# ---- endpoint: changer le statut d'un report ----
+@router.post("/mark_status")
+async def mark_status(
+    p: MarkStatusIn,
+    ok: bool = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    new_status = (p.status or "").strip().lower()
+    if new_status not in {"new", "confirmed", "resolved"}:
+        raise HTTPException(status_code=400, detail="invalid status")
+
+    # S’assure que la colonne existe (premier run / environnements anciens)
+    try:
+        await db.execute(text("ALTER TABLE reports ADD COLUMN IF NOT EXISTS status text"))
+        await db.commit()
+    except Exception:
+        await db.rollback()
+
+    # Mise à jour (id est un UUID)
+    try:
+        q = text("""
+            UPDATE reports
+               SET status = :s
+             WHERE id = CAST(:id AS uuid)
+         RETURNING id
+        """)
+        rs = await db.execute(q, {"s": new_status, "id": str(p.id)})
+        row = rs.first()
+        await db.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="report not found")
+        return {"ok": True, "id": str(p.id), "status": new_status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"mark_status failed: {e}")
