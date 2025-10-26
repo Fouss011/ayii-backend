@@ -14,11 +14,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 # Config & services internes
-from app.config import STATIC_DIR, STATIC_URL_PATH           # constants (pas d'app ici)
-from app.db import get_db                                   # async session factory
-from app.services.aggregation import run_aggregation        # ta tâche d’agrégation
-
-# ⚠️ NE PAS inclure de router ici (app pas encore créée)
+from app.config import STATIC_DIR, STATIC_URL_PATH
+from app.db import get_db
+from app.services.aggregation import run_aggregation
 
 # -----------------------------------------------------------------------------
 # Chargement .env en local (pas sur Render/Prod)
@@ -31,7 +29,6 @@ if os.getenv("RENDER") is None and os.getenv("ENV", "dev") == "dev":
 # -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- Startup ---
     enable = os.getenv("SCHEDULER_ENABLED", "1") != "0"
     scheduler = None
 
@@ -40,8 +37,8 @@ async def lifespan(app: FastAPI):
         scheduler = AsyncIOScheduler()
 
         async def job():
-            agen = get_db()                 # async generator
-            db = await agen.__anext__()     # AsyncSession
+            agen = get_db()
+            db = await agen.__anext__()
             try:
                 await run_aggregation(db)
             except Exception as e:
@@ -63,16 +60,12 @@ async def lifespan(app: FastAPI):
     else:
         print("[scheduler] disabled via SCHEDULER_ENABLED=0")
 
-    # Rendez le scheduler accessible si besoin
     app.state.scheduler = scheduler
-
     yield
 
-    # --- Shutdown ---
     if scheduler and scheduler.running:
         scheduler.shutdown(wait=False)
         print("[scheduler] stopped")
-
 
 # -----------------------------------------------------------------------------
 # App
@@ -90,8 +83,6 @@ allowed_origins = {
     "https://ayii.netlify.app",
     "http://localhost:3000",
 }
-
-# Surcharge via ALLOWED_ORIGINS="https://foo.netlify.app,https://bar.com"
 extra = (os.getenv("ALLOWED_ORIGINS") or "").strip()
 if extra:
     for o in extra.split(","):
@@ -99,14 +90,13 @@ if extra:
         if o:
             allowed_origins.add(o)
 
-# Autoriser aussi les Deploy Previews Netlify (regex)
 NETLIFY_REGEX = r"^https://[a-z0-9-]+(\-\-[a-z0-9-]+)?\.netlify\.app$"
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(list(allowed_origins)),
     allow_origin_regex=NETLIFY_REGEX,
-    allow_credentials=False,              # pas de cookies cross-site
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
@@ -114,9 +104,8 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# Fichiers statiques (pour servir les images locales uploadées)
+# Fichiers statiques
 # -----------------------------------------------------------------------------
-# Exemple: http(s)://<backend>/static/<filename>.jpg
 app.mount(STATIC_URL_PATH, StaticFiles(directory=STATIC_DIR), name="static")
 
 # -----------------------------------------------------------------------------
@@ -155,7 +144,7 @@ if os.getenv("ENV", "dev") == "dev":
         }
 
 # -----------------------------------------------------------------------------
-# no-store pour /map (éviter cache navigateur/CDN)
+# no-store pour /map
 # -----------------------------------------------------------------------------
 @app.middleware("http")
 async def no_store_cache(request: Request, call_next):
@@ -177,20 +166,16 @@ try:
 except Exception:
     pass
 
-# CTA séparé (protégé par x-admin-token) — ⚠️ inclure après app = FastAPI(...)
+# CTA (protégé par x-admin-token)
 try:
     from app.routes.admin_cta import router as cta_router         # noqa: E402
     app.include_router(cta_router)
 except Exception:
     pass
 
-# /dev/* uniquement en dev
-try:
-    if os.getenv("ENV", "dev") == "dev":
-        from app.routes.dev import router as dev_router            # noqa: E402
-        app.include_router(dev_router)
-except Exception:
-    pass
+# 👉 Dashboard CTA (AJOUT ICI, APRÈS app = FastAPI(...))
+from app.routes.dashboard import router as dashboard_router       # noqa: E402
+app.include_router(dashboard_router)
 
 # Optionnels si présents
 for opt in ("reverse", "outages"):

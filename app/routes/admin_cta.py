@@ -125,6 +125,29 @@ def _build_query_with_attachment(filter_by_status: bool) -> str:
 # GET /cta/incidents
 # Liste les reports avec dernière photo proche (si existante)
 # ---------------------------------------------------------------------
+# app/routes/admin_cta.py (extrait à coller/remplacer)
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+
+# suppose que ces helpers existent déjà dans ce fichier
+# from app.db import get_db
+# from .<ton_module> import require_admin, DEFAULT_LIMIT, _build_query_with_attachment
+
+router = APIRouter(prefix="/cta", tags=["CTA"])
+
+# Helper interne : tente de signer via _supabase_sign_url si dispo
+async def _maybe_sign_url(url: Optional[str], ttl_sec: int = 300) -> Optional[str]:
+    if not url:
+        return url
+    try:
+        signed = await _supabase_sign_url(url, expires_sec=ttl_sec)  # type: ignore[name-defined]
+        return signed or url
+    except Exception:
+        return url
+
 @router.get("/incidents")
 async def list_incidents(
     ok: bool = Depends(require_admin),
@@ -133,13 +156,12 @@ async def list_incidents(
     limit: int = Query(DEFAULT_LIMIT, ge=1, le=500),
 ):
     """
-    Liste des incidents pour CTA avec photo éventuellement signée (URL courte).
-    Utilise _build_query_with_attachment(filter_by_status=...) pour inclure une 'photo_url' par proximité.
+    Liste des incidents pour CTA avec URL d’image signée (si dispo).
+    Utilise _build_query_with_attachment(filter_by_status=...) pour inclure 'photo_url'.
     """
-    from datetime import datetime, timezone
     params: Dict[str, Any] = {"limit": int(limit)}
 
-    # 1) Récupération des lignes
+    # 1) Query SQL (avec ou sans filtre status)
     try:
         if status:
             params["status"] = status
@@ -148,44 +170,26 @@ async def list_incidents(
             q = text(_build_query_with_attachment(filter_by_status=False))
         rows = (await db.execute(q, params)).mappings().all()
     except Exception:
-        # fallback si la colonne status n'existe pas ou autre
         q = text(_build_query_with_attachment(filter_by_status=False))
         rows = (await db.execute(q, {"limit": int(limit)})).mappings().all()
 
+    # 2) Post-traitement : âge + signature photo
     now = datetime.now(timezone.utc)
-
-    # Helper: signe l'URL si _supabase_sign_url est dispo, sinon renvoie l'originale
-    async def _maybe_sign(url: Optional[str]) -> Optional[str]:
-        if not url:
-            return url
-        try:
-            # _supabase_sign_url doit être définie (ou importée) ailleurs
-            signed = await _supabase_sign_url(url, expires_sec=300)  # type: ignore[name-defined]
-            return signed or url
-        except Exception:
-            return url
-
-    # 2) Construction des items + signature C2 ici
     out: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
 
-        # âge en minutes
         created = d.get("created_at")
         try:
-            age_min = int((now - created).total_seconds() // 60) if created else None
+            d["age_min"] = int((now - created).total_seconds() // 60) if created else None
         except Exception:
-            age_min = None
-        d["age_min"] = age_min
+            d["age_min"] = None
 
-        # signature de la photo si présente
-        photo = d.get("photo_url")
-        d["photo_url"] = (await get_signed_cached(photo)) if photo else None
-
-
+        d["photo_url"] = await _maybe_sign_url(d.get("photo_url"), ttl_sec=300)
         out.append(d)
 
     return {"items": out, "count": len(out)}
+
 
 # ---------------------------------------------------------------------
 # POST /cta/cleanup
