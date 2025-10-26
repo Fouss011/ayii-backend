@@ -16,6 +16,47 @@ from app.config import BASE_PUBLIC_URL, STATIC_DIR, STATIC_URL_PATH  # constants
 
 router = APIRouter()
 
+async def _supabase_sign_url(public_or_path: str, expires_sec: int = 120) -> str | None:
+    """
+    Accepte soit une URL '.../object/public/<bucket>/<path>', soit un '<bucket>/<path>' ou juste '<path>'.
+    Retourne une URL signée (expire) ou None si erreur/config manquante.
+    """
+    supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
+    bucket = os.getenv("SUPABASE_BUCKET", "attachments")
+    if not (supa_url and supa_key):
+        return None
+
+    # Déduire "<bucket>/<path>"
+    after = None
+    if "/storage/v1/object/public/" in public_or_path:
+        try:
+            after = public_or_path.split("/storage/v1/object/public/")[1]
+        except Exception:
+            return None
+    else:
+        p = public_or_path.strip().lstrip("/")
+        after = p if p.startswith(bucket + "/") else f"{bucket}/{p}"
+
+    sign_endpoint = f"{supa_url}/storage/v1/object/sign/{after}"
+
+    try:
+        import httpx
+        headers = {"Authorization": f"Bearer {supa_key}", "Content-Type": "application/json"}
+        payload = {"expiresIn": int(expires_sec)}
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(sign_endpoint, headers=headers, json=payload)
+        if r.status_code not in (200, 201):
+            return None
+        data = r.json()
+        signedURL = data.get("signedURL") or data.get("signedUrl")
+        if not signedURL:
+            return None
+        return f"{supa_url}/storage/v1/{signedURL}"
+    except Exception:
+        return None
+
+
 # --------- Config ----------
 POINTS_WINDOW_MIN    = int(os.getenv("POINTS_WINDOW_MIN", "240"))
 MAX_REPORTS          = int(os.getenv("MAX_REPORTS", "500"))
@@ -1503,13 +1544,15 @@ async def attachments_near(
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
         if is_admin:
-            d["url"] = r.url
+            # ➜ signer l’URL (expire après 120 s). Si échec, on garde l’URL telle quelle.
+            signed = await _supabase_sign_url(r.url, expires_sec=120) if getattr(r, "url", None) else None
+            d["url"] = signed or r.url
             d["is_sensitive"] = bool(r.is_sensitive)
             d["uploader_id"] = r.uploader_id
         else:
-            # Public : pas d’URL. Message neutre.
             d["url"] = None
             d["note"] = "📷 Image réservée aux secours"
+
         out.append(d)
 
     return out

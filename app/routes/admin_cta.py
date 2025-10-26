@@ -6,6 +6,46 @@ from fastapi import APIRouter, Depends, HTTPException, Header, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
+async def _supabase_sign_url(public_or_path: str, expires_sec: int = 120) -> str | None:
+    """
+    Transforme une URL publique Supabase ou un chemin <bucket>/<path> en URL signée courte.
+    Retourne None si la signature est impossible (ex: clés manquantes).
+    """
+    supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
+    bucket = os.getenv("SUPABASE_BUCKET", "attachments")
+    if not (supa_url and supa_key):
+        return None
+
+    # Déduire "<bucket>/<path>"
+    if "/storage/v1/object/public/" in public_or_path:
+        try:
+            after = public_or_path.split("/storage/v1/object/public/")[1]
+        except Exception:
+            return None
+    else:
+        p = public_or_path.strip().lstrip("/")
+        after = p if p.startswith(bucket + "/") else f"{bucket}/{p}"
+
+    sign_endpoint = f"{supa_url}/storage/v1/object/sign/{after}"
+
+    try:
+        import httpx
+        headers = {"Authorization": f"Bearer {supa_key}", "Content-Type": "application/json"}
+        payload = {"expiresIn": int(expires_sec)}
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(sign_endpoint, headers=headers, json=payload)
+        if r.status_code not in (200, 201):
+            return None
+        data = r.json()
+        signedURL = data.get("signedURL") or data.get("signedUrl")
+        if not signedURL:
+            return None
+        return f"{supa_url}/storage/v1/{signedURL}"
+    except Exception:
+        return None
+
+
 # ✅ Import tolérant de get_db
 try:
     from app.dependencies import get_db  # si présent
@@ -80,39 +120,59 @@ async def list_incidents(
     status: Optional[str] = Query(None, description="Filtrer par status 'new'|'confirmed'|'resolved'"),
     limit: int = Query(DEFAULT_LIMIT, ge=1, le=500),
 ):
-    # Tente une version avec filtre status si fourni; si erreur (colonne manquante),
-    # retombe sur une version sans filtre.
+    """
+    Liste des incidents pour CTA avec photo éventuellement signée (URL courte).
+    Utilise _build_query_with_attachment(filter_by_status=...) pour inclure une 'photo_url' par proximité.
+    """
+    from datetime import datetime, timezone
     params: Dict[str, Any] = {"limit": int(limit)}
+
+    # 1) Récupération des lignes
     try:
         if status:
             params["status"] = status
             q = text(_build_query_with_attachment(filter_by_status=True))
         else:
             q = text(_build_query_with_attachment(filter_by_status=False))
-
         rows = (await db.execute(q, params)).mappings().all()
     except Exception:
-        # fallback (au cas où status n'existe pas, ou autre souci)
+        # fallback si la colonne status n'existe pas ou autre
         q = text(_build_query_with_attachment(filter_by_status=False))
         rows = (await db.execute(q, {"limit": int(limit)})).mappings().all()
 
-    # âge en minutes
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
 
+    # Helper: signe l'URL si _supabase_sign_url est dispo, sinon renvoie l'originale
+    async def _maybe_sign(url: Optional[str]) -> Optional[str]:
+        if not url:
+            return url
+        try:
+            # _supabase_sign_url doit être définie (ou importée) ailleurs
+            signed = await _supabase_sign_url(url, expires_sec=120)  # type: ignore[name-defined]
+            return signed or url
+        except Exception:
+            return url
+
+    # 2) Construction des items + signature C2 ici
     out: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
+
+        # âge en minutes
         created = d.get("created_at")
         try:
             age_min = int((now - created).total_seconds() // 60) if created else None
         except Exception:
             age_min = None
         d["age_min"] = age_min
+
+        # signature de la photo si présente
+        photo = d.get("photo_url")
+        d["photo_url"] = await _maybe_sign(photo)
+
         out.append(d)
 
     return {"items": out, "count": len(out)}
-
 
 # ---------------------------------------------------------------------
 # POST /cta/cleanup
