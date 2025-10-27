@@ -38,10 +38,14 @@ async def cta_ping():
 # - si url publique Supabase -> génère une URL signée courte
 # - sinon renvoie l'url telle quelle
 # -------------------------
+# -------------------------
+# Signature Supabase robuste (normalise /storage/v1/)
+# -------------------------
 async def _supabase_sign_url_if_possible(url: Optional[str], expires_sec: int = 300) -> Optional[str]:
     if not url:
         return url
 
+    import os
     supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
     supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
     if not (supa_url and supa_key):
@@ -49,31 +53,46 @@ async def _supabase_sign_url_if_possible(url: Optional[str], expires_sec: int = 
 
     marker = "/storage/v1/object/public/"
     if marker not in url:
-        return url  # on ne signe que les URLs publiques supabase
+        # pas une URL publique Supabase → on ne touche pas
+        return url
+
+    # extrait bucket + path, ex:
+    # https://.../storage/v1/object/public/attachments/fire/xxx.jpg
+    after = url.split(marker, 1)[1]                     # "attachments/fire/xxx.jpg"
+    parts = after.split("/", 1)
+    bucket = parts[0]
+    path = parts[1] if len(parts) > 1 else ""
+
+    # signe
+    import httpx
+    sign_endpoint = f"{supa_url}/storage/v1/object/sign/{bucket}/{path}"
+    payload = {"expiresIn": int(expires_sec)}
+    headers = {"Authorization": f"Bearer {supa_key}", "Content-Type": "application/json"}
 
     try:
-        after = url.split(marker, 1)[1]  # "attachments/xxx/yyy.jpg"
-        # POST https://.../storage/v1/object/sign/{after}
-        import httpx
-        endpoint = f"{supa_url}/storage/v1/object/sign/{after}"
-        payload  = {"expiresIn": int(expires_sec)}
-        headers  = {"Authorization": f"Bearer {supa_key}", "Content-Type": "application/json", "apikey": supa_key}
-
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(endpoint, headers=headers, json=payload)
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(sign_endpoint, headers=headers, json=payload)
         if r.status_code not in (200, 201):
             return url
         data = r.json()
-        signed = data.get("signedURL") or data.get("signedUrl")
-        if not signed:
-            return url
-        # signed est typiquement "/storage/v1/object/sign/attachments/....?token=..."
-        if signed.startswith("/"):
-            return f"{supa_url}{signed}"
-        # au cas où supabase retourne sans slash de tête:
-        return f"{supa_url}/storage/v1/{signed}".replace("/storage/v1//", "/storage/v1/")
+        signed_path = data.get("signedURL") or data.get("signedUrl") or ""
+
+        # ⚠️ normalisation du chemin renvoyé par Supabase
+        if signed_path.startswith("http"):
+            return signed_path
+        if signed_path.startswith("/storage/v1/"):
+            return f"{supa_url}{signed_path}"
+        if signed_path.startswith("/object/"):
+            return f"{supa_url}/storage/v1{signed_path}"
+        if signed_path.startswith("object/"):
+            return f"{supa_url}/storage/v1/{signed_path}"
+
+        # dernier recours : on reconstruit manuellement
+        return f"{supa_url}/storage/v1/object/sign/{bucket}/{path}?{signed_path.split('?',1)[-1]}" if "?" in signed_path \
+               else f"{supa_url}/storage/v1/object/sign/{bucket}/{path}"
     except Exception:
         return url
+
 
 
 # -------------------------
