@@ -186,10 +186,33 @@ async def dashboard_pro():
       });
     } catch(e){ console.error(e); }
   }
+  function severityScore(x){
+  const kind = String(x.kind||'').toLowerCase();
+  const ageMin = Number.isFinite(+x.age_min) ? +x.age_min : 9999;
+  const hasPhoto = !!x.photo_url;
+  const reports = Number(x.reports_count||0);
+  const attach  = Number(x.attachments_count||0);
+  const W_KIND = { fire: 30, accident: 25, flood: 18, power: 12, water: 10, traffic: 8 };
+  let s = W_KIND[kind] || 6;
+  if (ageMin <= 5) s += 25; else if (ageMin <= 15) s += 18; else if (ageMin <= 60) s += 8; else if (ageMin <= 180) s += 3;
+  if (hasPhoto) s += 10;
+  s += Math.min(20, reports * 4);
+  s += Math.min(12, attach  * 3);
+  return Math.max(0, Math.min(100, Math.round(s)));
+}
+function severityPill(score){
+  const lv = (score>=60) ? 'high' : (score>=30) ? 'med' : 'low';
+  const label = (lv==='high')?'Élevée':(lv==='med')?'Moyenne':'Faible';
+  const bg = (lv==='high')?'#fee2e2':(lv==='med')?'#ffedd5':'#dcfce7';
+  const fg = (lv==='high')?'#991b1b':(lv==='med')?'#9a3412':'#065f46';
+  return `<span class="pill" style="background:${bg};color:${fg};border:1px solid rgba(0,0,0,.06)">Gravité ${label} (${score})</span>`;
+}
+
 
   // Incidents table
   function fmtAgeMin(m){ return (m==null)? "-" : `${m} min`; }
   function renderIncidents(items){
+    <th class="p-2">Gravité</th>
     const rows = (items||[]).map(it => `
       <tr class="border-b last:border-none hover:bg-gray-50">
         <td class="p-2 text-xs text-gray-500">${it.id}</td>
@@ -199,6 +222,7 @@ async def dashboard_pro():
         <td class="p-2">${(it.created_at||"").replace("T"," ").replace("Z","")}</td>
         <td class="p-2"><span class="pill">${it.status}</span></td>
         <td class="p-2">${fmtAgeMin(it.age_min)}</td>
+        <td class="p-2">${severityPill(severityScore(it))}</td>
         <td class="p-2">${it.photo_url ? `<a href="${it.photo_url}" target="_blank" class="text-blue-600 underline">Photo</a>` : `<span class="text-gray-400">—</span>`}</td>
       </tr>`).join("");
     $("#incTable").innerHTML = `
@@ -220,6 +244,9 @@ async def dashboard_pro():
       const s = $("#status").value;
       const j = await getJSON(api(`/cta/incidents?status=${encodeURIComponent(s)}&limit=20`));
       renderIncidents(j.items || []);
+      const items = (j.items || []).slice().sort((a,b)=>severityScore(b)-severityScore(a));
+      renderIncidents(items);
+
     } catch(e){ console.error(e); }
   }
 

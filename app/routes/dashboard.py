@@ -184,12 +184,48 @@ async def dashboard_page(request: Request):
             } catch(e){
               alert('Action impossible: '+e.message);
             } finally { btn.disabled = false; btn.textContent = old; }
+            const sev = severityScore(x);
+            $('.chip', row).insertAdjacentHTML('afterend', ' ' + severityChip(sev));
           };
         });
 
         list.appendChild(frag);
       });
     }
+       // ---- Gravité (0-100) ----
+function severityScore(x){
+  // signaux disponibles dans ta réponse /cta/incidents
+  const kind = String(x.kind||'').toLowerCase();
+  const ageMin = Number.isFinite(+x.age_min) ? +x.age_min : 9999;
+  const hasPhoto = !!x.photo_url;
+  const reports = Number(x.reports_count||0);       // si pas présent, restera 0
+  const attach  = Number(x.attachments_count||0);   // si pas présent, restera 0
+
+  // poids par type (à adapter)
+  const W_KIND = { fire: 30, accident: 25, flood: 18, power: 12, water: 10, traffic: 8 };
+  let s = W_KIND[kind] || 6;
+
+  // récence (≤ 15 min très important)
+  if (ageMin <= 5) s += 25;
+  else if (ageMin <= 15) s += 18;
+  else if (ageMin <= 60) s += 8;
+  else if (ageMin <= 180) s += 3;
+
+  // signaux faibles/forts
+  if (hasPhoto) s += 10;
+  s += Math.min(20, reports * 4);
+  s += Math.min(12, attach  * 3);
+
+  return Math.max(0, Math.min(100, Math.round(s)));
+}
+function severityChip(score){
+  const lv = (score>=60) ? 'high' : (score>=30) ? 'med' : 'low';
+  const label = (lv==='high')?'Élevée':(lv==='med')?'Moyenne':'Faible';
+  const bg = (lv==='high')?'#fee2e2':(lv==='med')?'#ffedd5':'#dcfce7';
+  const fg = (lv==='high')?'#991b1b':(lv==='med')?'#9a3412':'#065f46';
+  return `<span class="chip" style="background:${bg};color:${fg};border:1px solid rgba(0,0,0,.06)">Gravité ${label} (${score})</span>`;
+}
+
 
     async function load(){
       if (!state.token) { $('#auth-status').textContent = 'Token manquant'; state.items = []; render(); return; }
@@ -229,6 +265,7 @@ async def dashboard_page(request: Request):
       $('#f-kind').onchange   = e => { state.filters.kind   = e.target.value; render(); };
       $('#f-limit').onchange  = e => { state.filters.limit  = +e.target.value; load(); };
       $('#f-search').oninput  = e => { state.filters.q      = e.target.value; render(); };
+      data.sort((a,b) => severityScore(b) - severityScore(a));
       $('#btn-refresh').onclick = () => load();
 
       load();
