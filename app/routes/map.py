@@ -1512,6 +1512,17 @@ async def admin_export_events_geojson(
 
 # --- Attachments près d'un point ---
 
+from typing import Optional
+from uuid import UUID
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+import os
+
+# … imports existants …
+# Assure-toi que get_signed_cached est dispo (défini plus haut dans le fichier, ou importé)
+# from app.routes.helpers import get_signed_cached   # si tu l'as mis ailleurs
+
 @router.get("/attachments_near")
 async def attachments_near(
     kind: str = Query(...),
@@ -1519,15 +1530,15 @@ async def attachments_near(
     lng: float = Query(..., ge=-180, le=180),
     radius_m: int = Query(150, ge=10, le=2000),
     hours: int = Query(48, ge=1, le=168),
-    viewer_user_id: Optional[UUID] = Query(None, description="Permet au rapporteur de voir sa propre image"),
+    viewer_user_id: Optional[UUID] = Query(None, description="Permet à l'auteur de voir sa propre image"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
     k = (kind or "").strip().lower()
-    if k not in {"traffic","accident","fire","flood","power","water"}:
+    if k not in {"traffic", "accident", "fire", "flood", "power", "water"}:
         raise HTTPException(status_code=400, detail="invalid kind")
 
-    # admin ?
+    # --- admin ? (via x-admin-token) ---
     is_admin = False
     try:
         admin_hdr = (request.headers.get("x-admin-token") or "").strip()
@@ -1536,59 +1547,71 @@ async def attachments_near(
     except Exception:
         pass
 
-    # fetch attachments (sans URL au début)
-    sql = text(f"""
-        WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-        SELECT id, url, ST_Y((geom::geometry)) AS lat, ST_X((geom::geometry)) AS lng,
-               user_id, created_at
-          FROM attachments
-         WHERE kind = :kind
-           AND created_at > NOW() - INTERVAL '{hours} hours'
-           AND ST_DWithin((geom::geography), (SELECT g FROM me), :r)
-         ORDER BY created_at DESC, id DESC
-         LIMIT 200
-    """)
-    rs = await db.execute(sql, {"kind": k, "lng": lng, "lat": lat, "r": radius_m})
-    rows = rs.fetchall()
+    # --- attachments proches (sans signer pour l'instant) ---
+    rs = await db.execute(
+        text("""
+            WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+            SELECT id, url, ST_Y((geom::geometry)) AS lat, ST_X((geom::geometry)) AS lng,
+                   user_id, created_at
+              FROM attachments
+             WHERE kind = :kind
+               AND created_at > NOW() - INTERVAL :hours
+               AND ST_DWithin((geom::geography), (SELECT g FROM me), :r)
+             ORDER BY created_at DESC, id DESC
+             LIMIT 200
+        """),
+        {"kind": k, "lng": lng, "lat": lat, "r": radius_m, "hours": f"{int(hours)} hours"},
+    )
+    rows = rs.mappings().all()
 
-    # ownership si pas admin
+    # --- vérif "auteur" si pas admin ---
     owner_ok = False
     if not is_admin and viewer_user_id:
-        chk = text("""
-            WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-            SELECT 1
-              FROM reports
-             WHERE user_id = :uid
-               AND LOWER(TRIM(kind::text)) = :k
-               AND LOWER(TRIM(signal::text)) = 'cut'
-               AND created_at > NOW() - INTERVAL '48 hours'
-               AND ST_DWithin((geom::geography),(SELECT g FROM me),150)
-             LIMIT 1
-        """)
-        q = await db.execute(chk, {"uid": str(viewer_user_id), "k": k, "lat": lat, "lng": lng})
-        owner_ok = (q.first() is not None)
+        chk = await db.execute(
+            text("""
+                WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+                SELECT 1
+                  FROM reports
+                 WHERE user_id = :uid
+                   AND LOWER(TRIM(kind::text))   = :k
+                   AND LOWER(TRIM(signal::text)) = 'cut'
+                   AND created_at > NOW() - INTERVAL '48 hours'
+                   AND ST_DWithin((geom::geography), (SELECT g FROM me), 150)
+                 LIMIT 1
+            """),
+            {"uid": str(viewer_user_id), "k": k, "lat": lat, "lng": lng},
+        )
+        owner_ok = (chk.first() is not None)
 
     out = []
     for r in rows:
-        url_signed = None
+        # On signe seulement si admin ou auteur autorisé
+        signed = None
         if is_admin or owner_ok:
-            # signe 2–5 min pour éviter le hotlink public
-            url_signed = await supabase_sign_url(r.url, expires_sec=180) if r.url else None
+            if r["url"]:
+                # URL signée robuste + petit cache mémoire
+                signed = await get_signed_cached(r["url"], cache_ttl=60, link_ttl_sec=300)
 
-        if not is_admin and not owner_ok:
+        if not (is_admin or owner_ok):
             out.append({
-                "id": r.id, "lat": float(r.lat), "lng": float(r.lng),
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-                "url": None, "note": "📷 Image réservée aux secours",
+                "id": str(r["id"]),
+                "lat": float(r["lat"]),
+                "lng": float(r["lng"]),
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "url": None,
+                "note": "📷 Image réservée à l'auteur ou aux secours",
             })
         else:
             out.append({
-                "id": r.id, "lat": float(r.lat), "lng": float(r.lng),
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-                "url": url_signed,
+                "id": str(r["id"]),
+                "lat": float(r["lat"]),
+                "lng": float(r["lng"]),
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "url": signed,               # <- lien signé Supabase
+                "uploader_id": str(r["user_id"]) if r["user_id"] else None,
                 "is_sensitive": True,
-                "uploader_id": r.user_id,
             })
+
     return out
 
 
