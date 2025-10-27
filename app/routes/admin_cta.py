@@ -47,37 +47,34 @@ async def _supabase_sign_url_if_possible(url: Optional[str], expires_sec: int = 
     if not (supa_url and supa_key):
         return url  # pas de signature possible
 
-    # On ne signe que les URLs publiques Supabase
     marker = "/storage/v1/object/public/"
     if marker not in url:
-        return url
+        return url  # on ne signe que les URLs publiques supabase
 
     try:
-        # Extrait bucket + path depuis l'URL publique
-        # ex: https://xxx.supabase.co/storage/v1/object/public/attachments/fire/xxx.jpg
-        after = url.split(marker, 1)[1]  # "attachments/fire/xxx.jpg"
-        parts = after.split("/", 1)
-        bucket = parts[0]
-        path = parts[1] if len(parts) > 1 else ""
-
-        # Appelle POST /storage/v1/object/sign/{bucket}/{path} {"expiresIn": seconds}
+        after = url.split(marker, 1)[1]  # "attachments/xxx/yyy.jpg"
+        # POST https://.../storage/v1/object/sign/{after}
         import httpx
-        sign_endpoint = f"{supa_url}/storage/v1/object/sign/{bucket}/{path}"
-        payload = {"expiresIn": int(expires_sec)}
-        headers = {"Authorization": f"Bearer {supa_key}", "Content-Type": "application/json"}
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(sign_endpoint, headers=headers, json=payload)
+        endpoint = f"{supa_url}/storage/v1/object/sign/{after}"
+        payload  = {"expiresIn": int(expires_sec)}
+        headers  = {"Authorization": f"Bearer {supa_key}", "Content-Type": "application/json", "apikey": supa_key}
+
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(endpoint, headers=headers, json=payload)
         if r.status_code not in (200, 201):
-            # si la signature échoue, on rend l'url d'origine
             return url
         data = r.json()
-        signed_path = data.get("signedURL") or data.get("signedUrl")  # compat keys
-        if not signed_path:
+        signed = data.get("signedURL") or data.get("signedUrl")
+        if not signed:
             return url
-        # Reconstruit URL absolue
-        return f"{supa_url}{signed_path}"
+        # signed est typiquement "/storage/v1/object/sign/attachments/....?token=..."
+        if signed.startswith("/"):
+            return f"{supa_url}{signed}"
+        # au cas où supabase retourne sans slash de tête:
+        return f"{supa_url}/storage/v1/{signed}".replace("/storage/v1//", "/storage/v1/")
     except Exception:
         return url
+
 
 # -------------------------
 # Lecture incidents pour CTA

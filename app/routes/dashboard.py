@@ -148,7 +148,10 @@ async def dashboard_page():
       if(q) data=data.filter(x => (x.id||'').toLowerCase().includes(q) || (x.note||'').toLowerCase().includes(q));
 
       // tri par gravité
-      data.sort((a,b)=>severityScore(b)-severityScore(a));
+      // tri par date : plus récent → plus vieux
+      const ts = d => Date.parse(d?.created_at || 0) || 0;
+      data.sort((a,b)=> ts(b) - ts(a));
+
 
       $('#summary').textContent = data.length+' élément(s)';
       const tpl=$('#tpl-row');
