@@ -1519,6 +1519,7 @@ async def attachments_near(
     lng: float = Query(..., ge=-180, le=180),
     radius_m: int = Query(150, ge=10, le=2000),
     hours: int = Query(48, ge=1, le=168),
+    viewer_user_id: Optional[UUID] = Query(None, description="Permet au rapporteur de voir sa propre image"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
@@ -1527,15 +1528,19 @@ async def attachments_near(
         raise HTTPException(status_code=400, detail="invalid kind")
 
     # admin ?
-    tok = (request.headers.get("x-admin-token") or "").strip()
-    is_admin = bool(ADMIN_TOKEN and tok == ADMIN_TOKEN)
+    is_admin = False
+    try:
+        admin_hdr = (request.headers.get("x-admin-token") or "").strip()
+        tok = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
+        is_admin = bool(tok) and admin_hdr == tok
+    except Exception:
+        pass
 
+    # fetch attachments (sans URL au début)
     sql = text(f"""
         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
-        SELECT id, url,
-               ST_Y((geom::geometry)) AS lat,
-               ST_X((geom::geometry)) AS lng,
-               uploader_id, created_at, is_sensitive
+        SELECT id, url, ST_Y((geom::geometry)) AS lat, ST_X((geom::geometry)) AS lng,
+               user_id, created_at
           FROM attachments
          WHERE kind = :kind
            AND created_at > NOW() - INTERVAL '{hours} hours'
@@ -1546,27 +1551,46 @@ async def attachments_near(
     rs = await db.execute(sql, {"kind": k, "lng": lng, "lat": lat, "r": radius_m})
     rows = rs.fetchall()
 
+    # ownership si pas admin
+    owner_ok = False
+    if not is_admin and viewer_user_id:
+        chk = text("""
+            WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+            SELECT 1
+              FROM reports
+             WHERE user_id = :uid
+               AND LOWER(TRIM(kind::text)) = :k
+               AND LOWER(TRIM(signal::text)) = 'cut'
+               AND created_at > NOW() - INTERVAL '48 hours'
+               AND ST_DWithin((geom::geography),(SELECT g FROM me),150)
+             LIMIT 1
+        """)
+        q = await db.execute(chk, {"uid": str(viewer_user_id), "k": k, "lat": lat, "lng": lng})
+        owner_ok = (q.first() is not None)
+
     out = []
     for r in rows:
-        d = {
-            "id": r.id,
-            "lat": float(r.lat),
-            "lng": float(r.lng),
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-        }
-        if is_admin:
-            # ➜ signer l’URL (expire après 120 s). Si échec, on garde l’URL telle quelle.
-            signed = await get_signed_cached(r.url) if getattr(r, "url", None) else None
-            d["url"] = signed or r.url
-            d["is_sensitive"] = bool(r.is_sensitive)
-            d["uploader_id"] = r.uploader_id
+        url_signed = None
+        if is_admin or owner_ok:
+            # signe 2–5 min pour éviter le hotlink public
+            url_signed = await supabase_sign_url(r.url, expires_sec=180) if r.url else None
+
+        if not is_admin and not owner_ok:
+            out.append({
+                "id": r.id, "lat": float(r.lat), "lng": float(r.lng),
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "url": None, "note": "📷 Image réservée aux secours",
+            })
         else:
-            d["url"] = None
-            d["note"] = "📷 Image réservée aux secours"
-
-        out.append(d)
-
+            out.append({
+                "id": r.id, "lat": float(r.lat), "lng": float(r.lng),
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "url": url_signed,
+                "is_sensitive": True,
+                "uploader_id": r.user_id,
+            })
     return out
+
 
 
 # --- Agrégations CSV (reports/events) ---
