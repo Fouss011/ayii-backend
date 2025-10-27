@@ -1539,7 +1539,7 @@ async def attachments_near(
     is_admin = False
     try:
         admin_hdr = (request.headers.get("x-admin-token") or "").strip()
-        tok = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
+        tok = (os.getenv("ADMIN_TOKEN") or "").strip()   # ← NE PAS lire NEXT_PUBLIC_ADMIN_TOKEN
         is_admin = bool(tok) and admin_hdr == tok
     except Exception:
         pass
