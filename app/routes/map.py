@@ -1514,23 +1514,10 @@ async def admin_export_events_geojson(
 
 from typing import Optional
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+import os
+from fastapi import HTTPException, Query, Request, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-import os
-
-# … imports existants …
-# Assure-toi que get_signed_cached est dispo (défini plus haut dans le fichier, ou importé)
-# from app.routes.helpers import get_signed_cached   # si tu l'as mis ailleurs
-
-from typing import Optional
-from uuid import UUID
-import os
-from fastapi import HTTPException, Query, Request, Depends, APIRouter
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
-
-router = APIRouter()
 
 @router.get("/attachments_near")
 async def attachments_near(
@@ -1540,6 +1527,7 @@ async def attachments_near(
     radius_m: int = Query(150, ge=10, le=2000),
     hours: int = Query(48, ge=1, le=168),
     viewer_user_id: Optional[UUID] = Query(None, description="Permet à l'auteur de voir sa propre image"),
+    debug: int = Query(0, description="1 pour renvoyer les erreurs détaillées"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
@@ -1556,78 +1544,92 @@ async def attachments_near(
     except Exception:
         pass
 
-    # --- attachments proches (pas de signature ici) ---
-    rs = await db.execute(
-        text("""
-            WITH me AS (
-                SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-            )
-            SELECT id,
-                   url,
-                   ST_Y(geom::geometry) AS lat,
-                   ST_X(geom::geometry) AS lng,
-                   user_id,
-                   created_at
-              FROM attachments
-             WHERE LOWER(TRIM(kind::text)) = :k
-               AND created_at > NOW() - (:hours::interval)
-               AND ST_DWithin(geom::geography, (SELECT g FROM me), :r)
-             ORDER BY created_at DESC, id DESC
-             LIMIT 200
-        """),
-        {"k": k, "lng": lng, "lat": lat, "r": radius_m, "hours": f"{int(hours)} hours"},
-    )
-    rows = rs.mappings().all()
-
-    # --- vérif "auteur" si pas admin ---
-    owner_ok = False
-    if (not is_admin) and viewer_user_id:
-        chk = await db.execute(
+    try:
+        # --- attachments proches (pas de signature ici) ---
+        rs = await db.execute(
             text("""
                 WITH me AS (
                     SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
                 )
-                SELECT 1
-                  FROM reports
-                 WHERE user_id = :uid
-                   AND LOWER(TRIM(kind::text))   = :k
-                   AND LOWER(TRIM(signal::text)) = 'cut'
-                   AND created_at > NOW() - (:hours::interval)
+                SELECT id,
+                       url,
+                       ST_Y(geom::geometry) AS lat,
+                       ST_X(geom::geometry) AS lng,
+                       user_id,
+                       created_at
+                  FROM attachments
+                 WHERE LOWER(TRIM(kind::text)) = :k
+                   AND created_at > NOW() - (:hours * INTERVAL '1 hour')
                    AND ST_DWithin(geom::geography, (SELECT g FROM me), :r)
-                 LIMIT 1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 200
             """),
-            {"uid": str(viewer_user_id), "k": k, "lng": lng, "lat": lat, "r": radius_m, "hours": f"{int(hours)} hours"},
+            {"k": k, "lng": lng, "lat": lat, "r": radius_m, "hours": int(hours)},
         )
-        owner_ok = (chk.first() is not None)
+        rows = rs.mappings().all()
 
-    out = []
-    for r in rows:
-        # Signature seulement si admin ou auteur autorisé
-        signed = None
-        if (is_admin or owner_ok) and r.get("url"):
-            signed = await get_signed_cached(r["url"], cache_ttl=60, link_ttl_sec=300)
+        # --- vérif "auteur" si pas admin ---
+        owner_ok = False
+        if (not is_admin) and viewer_user_id:
+            chk = await db.execute(
+                text("""
+                    WITH me AS (
+                        SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+                    )
+                    SELECT 1
+                      FROM reports
+                     WHERE user_id = :uid
+                       AND LOWER(TRIM(kind::text))   = :k
+                       AND LOWER(TRIM(signal::text)) = 'cut'
+                       AND created_at > NOW() - (:hours * INTERVAL '1 hour')
+                       AND ST_DWithin(geom::geography, (SELECT g FROM me), :r)
+                     LIMIT 1
+                """),
+                {"uid": str(viewer_user_id), "k": k, "lng": lng, "lat": lat, "r": radius_m, "hours": int(hours)},
+            )
+            owner_ok = (chk.first() is not None)
 
-        if is_admin or owner_ok:
-            out.append({
-                "id": str(r["id"]),
-                "lat": float(r["lat"]),
-                "lng": float(r["lng"]),
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                "url": signed,  # lien signé Supabase
-                "uploader_id": str(r["user_id"]) if r["user_id"] else None,
-                "is_sensitive": True,
-            })
-        else:
-            out.append({
-                "id": str(r["id"]),
-                "lat": float(r["lat"]),
-                "lng": float(r["lng"]),
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                "url": None,
-                "note": "📷 Image réservée à l'auteur ou aux secours",
-            })
+        out = []
+        for r in rows:
+            # Signature seulement si admin ou auteur autorisé
+            signed = None
+            if (is_admin or owner_ok) and r.get("url"):
+                try:
+                    signed = await get_signed_cached(r["url"], cache_ttl=60, link_ttl_sec=300)
+                except Exception:
+                    # En debug, expose l'erreur de signature pour diagnostiquer
+                    if debug:
+                        signed = None
 
-    return out
+            if is_admin or owner_ok:
+                out.append({
+                    "id": str(r["id"]),
+                    "lat": float(r["lat"]),
+                    "lng": float(r["lng"]),
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "url": signed,  # lien signé Supabase
+                    "uploader_id": str(r["user_id"]) if r["user_id"] else None,
+                    "is_sensitive": True,
+                })
+            else:
+                out.append({
+                    "id": str(r["id"]),
+                    "lat": float(r["lat"]),
+                    "lng": float(r["lng"]),
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "url": None,
+                    "note": "📷 Image réservée à l'auteur ou aux secours",
+                })
+
+        return out
+
+    except Exception as e:
+        if debug:
+            # renvoie l'erreur pour débug rapide
+            raise HTTPException(status_code=500, detail=f"attachments_near error: {e}")
+        # sinon, 500 standard
+        raise
+
 
 
 
