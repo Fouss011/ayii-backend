@@ -26,7 +26,7 @@ async def dashboard_pro():
     .pill { padding:.125rem .5rem; border-radius:999px; background:#f1f5f9; color:#334155; font-size:.75rem; font-weight:600 }
   </style>
 </head>
-<body class="bg-gray-50 text-gray-900">
+<body class="bg-slate-50 text-gray-900">
   <!-- largeur + grande -->
   <div class="mx-auto p-6 space-y-6" style="max-width: 1400px;">
     <header class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">

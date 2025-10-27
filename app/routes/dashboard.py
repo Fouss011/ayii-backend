@@ -4,76 +4,237 @@ from fastapi.responses import HTMLResponse
 
 router = APIRouter()
 
-
-# ---------- Helpers HTML commun ----------
-def _base_head(title: str) -> str:
-    return f"""
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{title}</title>
-<link rel="icon" href="data:,">
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<style>
-  :root {{
-    --bg:  #f8fafc;   /* slate-50 */
-    --fg:  #0f172a;   /* slate-900 */
-    --card:#ffffff;   /* white */
-    --muted:#64748b;  /* slate-500 */
-    --ring:#e2e8f0;   /* slate-200 */
-  }}
-  .dark :root, .dark {{
-    --bg:  #0b1220;   /* très sombre */
-    --fg:  #e5e7eb;   /* gris clair */
-    --card:#0f172a;   /* slate-900 */
-    --muted:#94a3b8;  /* slate-400 */
-    --ring:#1f2937;   /* gris foncé */
-  }}
-  html, body {{ background: var(--bg); color: var(--fg); }}
-  .card {{ background: var(--card); border: 1px solid var(--ring); border-radius: 1rem; box-shadow: 0 1px 2px rgba(0,0,0,.04); }}
-  .btn {{ display:inline-flex; align-items:center; gap:.5rem; border:1px solid var(--ring); padding:.5rem .75rem; border-radius:.75rem; font-weight:500; }}
-  .btn-primary {{ background:#4f46e5; color:white; border-color:#4f46e5; }}
-  .btn-ghost {{ background:var(--card); color:var(--fg); }}
-  .chip {{ font-size:.75rem; padding:.125rem .5rem; border-radius:999px; font-weight:600; }}
-  .chip-new {{ background:#fde68a33; color:#b45309; border:1px solid #fde68a; }}
-  .chip-confirmed {{ background:#bfdbfe33; color:#1e40af; border:1px solid #bfdbfe; }}
-  .chip-resolved {{ background:#a7f3d033; color:#065f46; border:1px solid #a7f3d0; }}
-  .thumb {{ width: 120px; height: 68px; object-fit: cover; border-radius: .75rem; background:#e2e8f0; }}
-  .row {{ display:grid; grid-template-columns: auto 1fr auto; gap:1rem; align-items:center; }}
-  .sticky-top {{ position: sticky; top: 0; z-index: 20; background: var(--bg); }}
-  /* icônes inline (fallback) */
-  .icon {{
-    width:120px; height:68px; border-radius:.75rem; display:flex; align-items:center; justify-content:center;
-    background:linear-gradient(135deg,#f1f5f9,#e2e8f0);
-    color:#0f172a; font-weight:700; font-family:ui-sans-serif,system-ui; letter-spacing:.5px;
-  }}
-</style>
-<script>
-  // dark mode auto + toggle
-  (function(){{
-    const key = 'ayii_theme';
-    const saved = localStorage.getItem(key);
-    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    const isDark = saved ? saved === 'dark' : prefersDark;
-    if (isDark) document.documentElement.classList.add('dark');
-    window.__toggleTheme = function(){{
-      const nowDark = document.documentElement.classList.toggle('dark');
-      localStorage.setItem(key, nowDark ? 'dark':'light');
-    }}
-  }})();
-  const $=(s,el=document)=>el.querySelector(s);
-</script>
-"""
-
-
-# ---------- Page 1 : Tableau d’actions ----------
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
-    return f"""
+    return """
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-  {_base_head("AYii — Dashboard CTA")}
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AYii — Dashboard CTA</title>
+  <link rel="icon" href="data:,">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root {
+      --bg:  #f8fafc;   /* slate-50 */
+      --fg:  #0f172a;   /* slate-900 */
+      --card:#ffffff;   /* white */
+      --muted:#64748b;  /* slate-500 */
+      --ring:#e2e8f0;   /* slate-200 */
+    }
+    .dark :root, .dark {
+      --bg:  #0b1220;
+      --fg:  #e5e7eb;
+      --card:#0f172a;
+      --muted:#94a3b8;
+      --ring:#1f2937;
+    }
+    html, body { background: var(--bg); color: var(--fg); }
+    .card { background: var(--card); border: 1px solid var(--ring); border-radius: 1rem; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+    .btn { display:inline-flex; align-items:center; gap:.5rem; border:1px solid var(--ring); padding:.5rem .75rem; border-radius:.75rem; font-weight:500; }
+    .btn-primary { background:#4f46e5; color:white; border-color:#4f46e5; }
+    .btn-ghost { background:var(--card); color:var(--fg); }
+    .chip { font-size:.75rem; padding:.125rem .5rem; border-radius:999px; font-weight:600; }
+    .chip-new { background:#fde68a33; color:#b45309; border:1px solid #fde68a; }
+    .chip-confirmed { background:#bfdbfe33; color:#1e40af; border:1px solid #bfdbfe; }
+    .chip-resolved { background:#a7f3d033; color:#065f46; border:1px solid #a7f3d0; }
+    .row { display:grid; grid-template-columns: auto 1fr auto; gap:1rem; align-items:center; }
+    .sticky-top { position: sticky; top: 0; z-index: 20; background: var(--bg); }
+    .thumbbox { width:120px; height:68px; position:relative; }
+    .thumb { width:120px; height:68px; object-fit:cover; border-radius:.75rem; display:block; }
+    .icon {
+      width:120px; height:68px; border-radius:.75rem; display:flex; align-items:center; justify-content:center;
+      background:linear-gradient(135deg,#f1f5f9,#e2e8f0);
+      color:#0f172a; font-weight:700; font-family:ui-sans-serif,system-ui;
+      position:absolute; inset:0;
+    }
+  </style>
+  <script>
+    // Thème sombre auto + bouton toggle
+    (function(){
+      const key = 'ayii_theme';
+      const saved = localStorage.getItem(key);
+      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      const isDark = saved ? saved === 'dark' : prefersDark;
+      if (isDark) document.documentElement.classList.add('dark');
+      window.__toggleTheme = function(){
+        const nowDark = document.documentElement.classList.toggle('dark');
+        localStorage.setItem(key, nowDark ? 'dark':'light');
+      }
+    })();
+
+    const $  = (s,el=document)=>el.querySelector(s);
+    const $$ = (s,el=document)=>Array.from(el.querySelectorAll(s));
+
+    // Libellés + icônes (comme demandé)
+    function labelKind(k){
+      return k === "traffic"  ? "embouteillage" :
+             k === "accident" ? "accident" :
+             k === "fire"     ? "incendie" :
+             k === "flood"    ? "inondation" :
+             k === "power"    ? "électricité" :
+             k === "water"    ? "eau" : (k || "—");
+    }
+    function iconKind(k){
+      return k === "traffic"  ? "🚗" :
+             k === "accident" ? "💥" :
+             k === "fire"     ? "🔥" :
+             k === "flood"    ? "🌊" :
+             k === "power"    ? "⚡" :
+             k === "water"    ? "💧" : "•";
+    }
+
+    const api = {
+      incidents: (token, {status, limit}) => {
+        const u = new URL('/cta/incidents', window.location.origin);
+        if (status) u.searchParams.set('status', status);
+        u.searchParams.set('limit', limit || 100);
+        return fetch(u, { headers: {'x-admin-token': token} }).then(r => r.json());
+      },
+      mark: (token, id, newStatus) => {
+        return fetch('/cta/mark_status', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json','x-admin-token': token},
+          body: JSON.stringify({ id, status: newStatus })
+        }).then(r => r.json());
+      }
+    };
+
+    const state = {
+      items: [],
+      token: localStorage.getItem('ayii_admin_token') || '',
+      filters: { status: '', kind: '', limit: 100, q: '' }
+    };
+
+    function updateExportLinks(){
+      const t = encodeURIComponent(state.token || '');
+      $('#btn-export-reports').href = '/admin/export_reports.csv?date_from=2025-01-01&token='+t;
+      $('#btn-export-events').href  = '/admin/export_events.csv?table=both&token='+t;
+    }
+
+    // Construction de la vignette avec fallback propre
+    function buildThumbHTML(item){
+      const icon = iconKind(item.kind);
+      const url  = item.photo_url || '';
+      // Le <div class="icon"> est affiché par défaut. Si l'image charge => on cache l'icon.
+      // En cas d'erreur de chargement, l'icon reste visible.
+      return `
+        <div class="thumbbox">
+          <div class="icon">${icon}</div>
+          ${url ? `<img class="thumb" src="${url}" alt="${item.kind||''}"
+                    onload="this.previousElementSibling.style.display='none'"
+                    onerror="this.style.display='none'; this.previousElementSibling.style.display='flex'">`
+                : ``}
+        </div>
+      `;
+    }
+
+    function render(){
+      const list = $('#list');
+      list.innerHTML = '';
+      let data = state.items.slice();
+
+      // filtre client
+      if (state.filters.kind) data = data.filter(x => (x.kind||'').toLowerCase() === state.filters.kind);
+
+      // recherche simple
+      const q = (state.filters.q || '').trim().toLowerCase();
+      if (q) data = data.filter(x =>
+        (x.id||'').toLowerCase().includes(q) ||
+        (x.note||'').toLowerCase().includes(q)
+      );
+
+      $('#summary').textContent = data.length + ' élément(s)';
+
+      const tpl = $('#tpl-row');
+      data.forEach(x => {
+        const frag = tpl.content.cloneNode(true);
+
+        // vignette
+        const thumbHost = $('.thumbhost', frag);
+        thumbHost.innerHTML = buildThumbHTML(x);
+
+        // libellé + icône
+        $('[data-kind]', frag).textContent = iconKind(x.kind) + ' ' + labelKind(x.kind);
+
+        // statut
+        const st = (x.status||'new');
+        const chip = $('.chip', frag);
+        chip.textContent = st;
+        chip.classList.add('chip-'+st);
+
+        // infos
+        $('[data-id]',  frag).textContent = (x.id||'').slice(0,8);
+        $('[data-geo]', frag).textContent = (+x.lat).toFixed(5) + ', ' + (+x.lng).toFixed(5);
+        $('[data-when]',frag).textContent = (x.created_at||'').replace('T',' ').replace('Z','');
+        $('[data-age]', frag).textContent = (x.age_min!=null) ? ('il y a ' + x.age_min + ' min') : '';
+
+        // actions
+        $$('[data-act]', frag).forEach(btn => {
+          btn.onclick = async () => {
+            if (!state.token) { alert('Token requis'); return; }
+            const act = btn.getAttribute('data-act');
+            const next = (act === 'confirm') ? 'confirmed' : 'resolved';
+            btn.disabled = true; const old = btn.textContent; btn.textContent = '…';
+            try {
+              const res = await api.mark(state.token, x.id, next);
+              if (!res.ok) throw new Error(res.detail || 'Erreur');
+              x.status = next; render();
+            } catch(e){
+              alert('Action impossible: '+e.message);
+            } finally { btn.disabled = false; btn.textContent = old; }
+          };
+        });
+
+        list.appendChild(frag);
+      });
+    }
+
+    async function load(){
+      if (!state.token) { $('#auth-status').textContent = 'Token manquant'; state.items = []; render(); return; }
+      $('#auth-status').textContent = 'Chargement…';
+      try {
+        const data = await api.incidents(state.token, {status: state.filters.status, limit: state.filters.limit});
+        state.items = data.items || [];
+        $('#auth-status').textContent = 'OK';
+      } catch(e){
+        state.items = [];
+        $('#auth-status').textContent = 'Erreur d’accès (token ?)';
+      }
+      render();
+    }
+
+    // INIT UI
+    window.addEventListener('DOMContentLoaded', () => {
+      $('#token').value = state.token;
+      updateExportLinks();
+
+      $('#btn-save-token').onclick = () => {
+        state.token = $('#token').value.trim();
+        localStorage.setItem('ayii_admin_token', state.token);
+        $('#auth-status').textContent = state.token ? 'Token enregistré' : 'Aucun token';
+        updateExportLinks();
+        load();
+      };
+      $('#btn-clear-token').onclick = () => {
+        localStorage.removeItem('ayii_admin_token');
+        state.token = '';
+        $('#token').value = '';
+        updateExportLinks();
+        render();
+      };
+
+      $('#f-status').onchange = e => { state.filters.status = e.target.value; load(); };
+      $('#f-kind').onchange   = e => { state.filters.kind   = e.target.value; render(); };
+      $('#f-limit').onchange  = e => { state.filters.limit  = +e.target.value; load(); };
+      $('#f-search').oninput  = e => { state.filters.q      = e.target.value; render(); };
+      $('#btn-refresh').onclick = () => load();
+
+      load();
+      setInterval(() => { if (state.token) load(); }, 60000);
+    });
+  </script>
 </head>
 <body>
   <div class="sticky-top border-b" style="border-color:var(--ring);">
@@ -155,7 +316,7 @@ async def dashboard_page(request: Request):
 
   <template id="tpl-row">
     <div class="row p-4">
-      <div class="thumb"></div>
+      <div class="thumbhost"><!-- vignette image + fallback icône injectée ici --></div>
       <div class="space-y-1">
         <div class="flex items-center gap-2">
           <span data-kind class="text-[11px] font-semibold px-2 py-0.5 rounded-md" style="background:#e2e8f0; color:#334155;"></span>
@@ -176,133 +337,6 @@ async def dashboard_page(request: Request):
       </div>
     </div>
   </template>
-
-  <script>
-    const $$=(s,el=document)=>Array.from(el.querySelectorAll(s));
-    const api = {{
-      incidents: (token, {{status, limit}}) => {{
-        const u = new URL('/cta/incidents', window.location.origin);
-        if (status) u.searchParams.set('status', status);
-        u.searchParams.set('limit', limit || 100);
-        return fetch(u, {{ headers: {{'x-admin-token': token}} }}).then(r => r.json());
-      }},
-      mark: (token, id, newStatus) => {{
-        return fetch('/cta/mark_status', {{
-          method: 'POST',
-          headers: {{'Content-Type':'application/json','x-admin-token': token}},
-          body: JSON.stringify({{ id, status: newStatus }})
-        }}).then(r => r.json());
-      }}
-    }};
-
-    const ICONS = {{
-      fire:'🔥', accident:'🚗', flood:'🌊', traffic:'🚧', power:'⚡', water:'💧'
-    }};
-
-    const state = {{
-      items: [],
-      token: localStorage.getItem('ayii_admin_token') || '',
-      filters: {{ status: '', kind: '', limit: 100, q: '' }}
-    }};
-
-    $('#token').value = state.token;
-    function updateExportLinks(){{
-      const t = encodeURIComponent(state.token || '');
-      $('#btn-export-reports').href = '/admin/export_reports.csv?date_from=2025-01-01&token='+t;
-      $('#btn-export-events').href  = '/admin/export_events.csv?table=both&token='+t;
-    }}
-    updateExportLinks();
-
-    $('#btn-save-token').onclick = () => {{
-      state.token = $('#token').value.trim();
-      localStorage.setItem('ayii_admin_token', state.token);
-      $('#auth-status').textContent = state.token ? 'Token enregistré' : 'Aucun token';
-      updateExportLinks();
-      load();
-    }};
-    $('#btn-clear-token').onclick = () => {{
-      localStorage.removeItem('ayii_admin_token');
-      state.token = '';
-      $('#token').value = '';
-      updateExportLinks();
-      render();
-    }};
-
-    $('#f-status').onchange = e => {{ state.filters.status = e.target.value; load(); }};
-    $('#f-kind').onchange   = e => {{ state.filters.kind   = e.target.value; render(); }};
-    $('#f-limit').onchange  = e => {{ state.filters.limit  = +e.target.value; load(); }};
-    $('#f-search').oninput  = e => {{ state.filters.q      = e.target.value.toLowerCase(); render(); }};
-    $('#btn-refresh').onclick = () => load();
-
-    function thumbHTML(x){{
-      const url = x.photo_url;
-      if (url) return `<img class="thumb" src="${{url}}" alt="${{x.kind||''}}" onerror="this.replaceWith(document.createRange().createContextualFragment('<div class=icon>${{ICONS[x.kind]||'—'}}</div>'));" />`;
-      return `<div class="icon">${{ICONS[x.kind]||'—'}}</div>`;
-    }}
-
-    function render(){{
-      const list = $('#list');
-      list.innerHTML = '';
-      let data = state.items.slice();
-      if (state.filters.kind) data = data.filter(x => (x.kind||'').toLowerCase() === state.filters.kind);
-      const q = (state.filters.q || '').trim();
-      if (q) data = data.filter(x => (x.id||'').toLowerCase().includes(q) || (x.note||'').toLowerCase().includes(q));
-      $('#summary').textContent = `${{data.length}} élément(s)`;
-      const tpl = $('#tpl-row');
-
-      data.forEach(x => {{
-        const frag = tpl.content.cloneNode(true);
-        // vignette
-        $('.thumb', frag).outerHTML = thumbHTML(x);
-
-        $('[data-kind]', frag).textContent = ({{fire:'Feu',accident:'Accident',flood:'Inondation',traffic:'Trafic',power:'Élec.',water:'Eau'}}[x.kind] || x.kind);
-        const chip = $('.chip', frag);
-        const st = (x.status||'new');
-        chip.textContent = st;
-        chip.classList.add('chip-'+st);
-
-        $('[data-id]', frag).textContent = (x.id||'').slice(0,8);
-        $('[data-geo]', frag).textContent = `${{(+x.lat).toFixed(5)}}, ${{(+x.lng).toFixed(5)}}`;
-        $('[data-when]', frag).textContent = (x.created_at||'').replace('T',' ').replace('Z','');
-        $('[data-age]', frag).textContent = x.age_min != null ? `il y a ${{x.age_min}} min` : '';
-
-        $$('[data-act]', frag).forEach(btn => {{
-          btn.onclick = async () => {{
-            if (!state.token) {{ alert('Token requis'); return; }}
-            const act = btn.getAttribute('data-act');
-            const next = act === 'confirm' ? 'confirmed' : 'resolved';
-            btn.disabled = true; btn.textContent = '…';
-            try {{
-              const res = await api.mark(state.token, x.id, next);
-              if (!res.ok) throw new Error(res.detail || 'Erreur');
-              x.status = next; render();
-            }} catch(e) {{
-              alert('Action impossible: '+e.message);
-            }} finally {{ btn.disabled = false; }}
-          }};
-        }});
-
-        list.appendChild(frag);
-      }});
-    }}
-
-    async function load(){{
-      if (!state.token) {{ $('#auth-status').textContent = 'Token manquant'; state.items = []; render(); return; }}
-      $('#auth-status').textContent = 'Chargement…';
-      try {{
-        const data = await api.incidents(state.token, {{status: state.filters.status, limit: state.filters.limit}});
-        state.items = data.items || [];
-        $('#auth-status').textContent = 'OK';
-      }} catch(e){{
-        state.items = [];
-        $('#auth-status').textContent = 'Erreur d’accès (token ?)';
-      }}
-      render();
-    }}
-
-    load();
-    setInterval(() => {{ if (state.token) load(); }}, 60000);
-  </script>
 </body>
 </html>
 """
