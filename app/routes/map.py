@@ -1813,8 +1813,6 @@ from sqlalchemy import text
 from typing import Optional
 from ..db import get_db  # adapte si besoin
 
-router = APIRouter()
-
 @router.get("/alert_zones")
 async def alert_zones(
     kind: str = Query(..., description="fire|traffic|accident|flood|power|water"),
