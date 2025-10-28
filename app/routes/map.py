@@ -1805,6 +1805,16 @@ async def responder_ack(
         raise HTTPException(500, f"ack failed: {e}")
     
 # ---------- ZONES D’ALERTE (lecture) ----------
+# routes_alert_zones.py
+import os
+from fastapi import APIRouter, Query, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from typing import Optional
+from .db import get_db  # adapte si besoin
+
+router = APIRouter()
+
 @router.get("/alert_zones")
 async def alert_zones(
     kind: str = Query(..., description="fire|traffic|accident|flood|power|water"),
@@ -1813,30 +1823,26 @@ async def alert_zones(
     radius_km: float = Query(1.0, ge=0.1, le=50),
     hours: int = Query(int(os.getenv("ALERT_WINDOW_HOURS", "3")), ge=1, le=72),
     min_count: int = Query(int(os.getenv("ALERT_MIN_REPORTS", "3")), ge=2, le=50),
-    cell_m: int = Query(int(os.getenv("ALERT_RADIUS_M", "150")), ge=50, le=1000),  # taille cellule pour grouper (~rayon)
+    cell_m: int = Query(int(os.getenv("ALERT_RADIUS_M", "150")), ge=50, le=1000),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Regroupe les reports 'cut' récents par proximité (grille ~cell_m) et renvoie
-    les clusters dont la taille >= min_count. Exclut les zones près d’un ACK pompier.
-    """
     k = (kind or "").strip().lower()
     if k not in {"traffic","accident","fire","flood","power","water"}:
         raise HTTPException(status_code=400, detail="invalid kind")
 
-    # approx degré pour cell_m (150m ≈ 0.00135°) — suffisant pour grouper à l’échelle urbaine
+    # ~150 m → degrés
     cell_deg = max(0.0003, min(0.01, cell_m / 111_000.0))
 
-    q = text("""
+    sql = text("""
       WITH me AS (
         SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
       ),
       base AS (
         SELECT id, kind, created_at, (geom::geography) AS gg
         FROM reports
-        WHERE LOWER(TRIM(kind::text)) = :kind
+        WHERE LOWER(TRIM(kind::text))   = :kind
           AND LOWER(TRIM(signal::text)) = 'cut'
-          AND created_at > NOW() - INTERVAL :hours
+          AND created_at > NOW() - make_interval(hours => :hours)
           AND ST_DWithin((geom::geography), (SELECT g FROM me), :rad_m)
       ),
       cells AS (
@@ -1872,7 +1878,7 @@ async def alert_zones(
         WHERE ak.kind = z.kind
           AND ST_DWithin(
             (ST_SetSRID(ST_MakePoint(z.lng, z.lat),4326)::geography),
-            ak.geom,
+            (ak.geom::geography),
             :ack_r
           )
       )
@@ -1880,27 +1886,29 @@ async def alert_zones(
       LIMIT 50
     """)
 
-    rs = await db.execute(q, {
+    params = {
         "kind": k,
         "lng": lng, "lat": lat,
         "rad_m": float(radius_km) * 1000.0,
-        "hours": f"{int(hours)} hours",
+        "hours": int(hours),
         "cell_deg": float(cell_deg),
         "min_count": int(min_count),
         "ack_r": float(cell_m),
-    })
-    rows = rs.mappings().all()
+    }
+
+    try:
+        rs = await db.execute(sql, params)
+        rows = rs.mappings().all()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"alert_zones failed: {e}")
 
     return [
-        {
-            "kind": r["kind"],
-            "lat": float(r["lat"]),
-            "lng": float(r["lng"]),
-            "radius_m": int(cell_m),
-            "count": int(r["count"]),
-        }
+        {"kind": r["kind"], "lat": float(r["lat"]), "lng": float(r["lng"]),
+         "radius_m": int(cell_m), "count": int(r["count"])}
         for r in rows
     ]
+
 
 
 # ---------- PRISE EN CHARGE POMPIER / ADMIN (écriture) ----------
