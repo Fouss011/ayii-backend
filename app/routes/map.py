@@ -1875,7 +1875,7 @@ async def alert_zones(
       WHERE NOT EXISTS (
         SELECT 1
         FROM acks ak
-        WHERE ak.kind = z.kind
+        WHERE LOWER(TRIM(ak.kind::text)) = LOWER(TRIM(z.kind::text))
           AND ST_DWithin(
             (ST_SetSRID(ST_MakePoint(z.lng, z.lat),4326)::geography),
             (ak.geom::geography),
@@ -1885,6 +1885,7 @@ async def alert_zones(
       ORDER BY z.count DESC
       LIMIT 50
     """)
+
 
     params = {
         "kind": k,
