@@ -1807,110 +1807,98 @@ async def responder_ack(
 # ---------- ZONES D’ALERTE (lecture) ----------
 @router.get("/alert_zones")
 async def alert_zones(
+    kind: str = Query(..., description="fire|traffic|accident|flood|power|water"),
     lat: float = Query(..., ge=-90, le=90),
     lng: float = Query(..., ge=-180, le=180),
-    radius_km: float = Query(1.0, gt=0, le=50),
-    kind: Optional[str] = Query(None, description="filtrer: fire|accident|traffic|flood|power|water"),
-    threshold: int = Query(int(os.getenv("ALERT_MIN_REPORTS","3")), ge=2, le=20),
-    window_min: int = Query(int(os.getenv("ALERT_WINDOW_MIN","180")), ge=5, le=1440),
-    group_radius_m: int = Query(int(os.getenv("ALERT_RADIUS_M","100")), ge=50, le=1000),
+    radius_km: float = Query(1.0, ge=0.1, le=50),
+    hours: int = Query(int(os.getenv("ALERT_WINDOW_HOURS", "3")), ge=1, le=72),
+    min_count: int = Query(int(os.getenv("ALERT_MIN_REPORTS", "3")), ge=2, le=50),
+    cell_m: int = Query(int(os.getenv("ALERT_RADIUS_M", "150")), ge=50, le=1000),  # taille cellule pour grouper (~rayon)
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Regroupe les reports 'cut' récents par proximité (DBSCAN) et renvoie les clusters
-    dont la taille >= threshold, sauf si un ACK (prise en charge) se trouve dans le même rayon.
+    Regroupe les reports 'cut' récents par proximité (grille ~cell_m) et renvoie
+    les clusters dont la taille >= min_count. Exclut les zones près d’un ACK pompier.
     """
-    if kind:
-        k = kind.strip().lower()
-        if k not in {"traffic","accident","fire","flood","power","water"}:
-            raise HTTPException(400, "invalid kind")
-    else:
-        k = None
+    k = (kind or "").strip().lower()
+    if k not in {"traffic","accident","fire","flood","power","water"}:
+        raise HTTPException(status_code=400, detail="invalid kind")
 
-    r_m = float(radius_km) * 1000.0
-    # Zone d’intérêt autour (lat,lng)
-    # 1) On extrait les reports récents dans la zone
-    base_sql = f"""
-        WITH me AS (
-          SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-        ), pts AS (
-          SELECT
-            id,
-            kind::text AS kind,
-            ST_SnapToGrid(ST_Transform((geom::geometry),3857), 1.0) AS g3857, -- aide perf
-            (geom::geometry) AS g4326,
-            created_at
-          FROM reports
-          WHERE created_at > NOW() - INTERVAL '{window_min} minutes'
-            AND LOWER(TRIM(signal::text)) = 'cut'
-            AND ST_DWithin((geom::geography), (SELECT g FROM me), :r)
-            { "AND kind = :k" if k else "" }
-        ),
-        clus AS (
-          SELECT
-            kind,
-            ST_ClusterDBSCAN(g3857, eps := :eps, minpoints := 2) OVER () AS cid,   -- eps en mètres (en 3857 ≈ mètres)
-            g4326
-          FROM pts
-        ),
-        agg AS (
-          SELECT
-            kind,
-            cid,
-            COUNT(*)::int AS n,
-            ST_Transform(ST_Centroid(ST_Collect(g4326)), 4326) AS center4326
-          FROM clus
-          WHERE cid IS NOT NULL
-          GROUP BY kind, cid
-        )
+    # approx degré pour cell_m (150m ≈ 0.00135°) — suffisant pour grouper à l’échelle urbaine
+    cell_deg = max(0.0003, min(0.01, cell_m / 111_000.0))
+
+    q = text("""
+      WITH me AS (
+        SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+      ),
+      base AS (
+        SELECT id, kind, created_at, (geom::geography) AS gg
+        FROM reports
+        WHERE LOWER(TRIM(kind::text)) = :kind
+          AND LOWER(TRIM(signal::text)) = 'cut'
+          AND created_at > NOW() - INTERVAL :hours
+          AND ST_DWithin((geom::geography), (SELECT g FROM me), :rad_m)
+      ),
+      cells AS (
         SELECT
-          a.kind,
-          a.n,
-          ST_Y(a.center4326) AS lat,
-          ST_X(a.center4326) AS lng
-        FROM agg a
-        WHERE a.n >= :threshold
-    """
-    # Exclure celles "prises en charge" (ack) à proximité
-    # si un ack de même kind existe dans group_radius_m → on filtre
-    sql = text(f"""
-        WITH zones AS (
-          {base_sql}
-        )
-        SELECT z.kind, z.n, z.lat, z.lng
-        FROM zones z
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM acks ak
-          WHERE ak.kind = z.kind
-            AND ST_DWithin(
-              (ST_SetSRID(ST_MakePoint(z.lng, z.lat),4326)::geography),
-              ak.geom,
-              :ack_r
-            )
-        )
-        ORDER BY z.kind, z.n DESC
+          kind,
+          ST_SnapToGrid((gg::geometry), :cell_deg, :cell_deg) AS grid,
+          gg
+        FROM base
+      ),
+      grouped AS (
+        SELECT
+          kind,
+          grid,
+          COUNT(*) AS count,
+          ST_Centroid(ST_Collect(gg::geometry)) AS center_geom
+        FROM cells
+        GROUP BY kind, grid
+        HAVING COUNT(*) >= :min_count
+      ),
+      zones AS (
+        SELECT
+          kind,
+          count::int AS count,
+          ST_Y(center_geom) AS lat,
+          ST_X(center_geom) AS lng
+        FROM grouped
+      )
+      SELECT z.kind, z.count, z.lat, z.lng
+      FROM zones z
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM acks ak
+        WHERE ak.kind = z.kind
+          AND ST_DWithin(
+            (ST_SetSRID(ST_MakePoint(z.lng, z.lat),4326)::geography),
+            ak.geom,
+            :ack_r
+          )
+      )
+      ORDER BY z.count DESC
+      LIMIT 50
     """)
 
-    # eps pour DBSCAN (projection WebMercator en mètres ~ ok en milieu de carte)
-    params = {
-        "lat": lat, "lng": lng, "r": r_m,
-        "eps": float(group_radius_m),
-        "threshold": int(threshold),
-        "ack_r": float(group_radius_m),
-    }
-    if k:
-        params["k"] = k
-
-    try:
-        res = await db.execute(sql, params)
-        rows = res.fetchall()
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(500, f"alert_zones failed: {e}")
+    rs = await db.execute(q, {
+        "kind": k,
+        "lng": lng, "lat": lat,
+        "rad_m": float(radius_km) * 1000.0,
+        "hours": f"{int(hours)} hours",
+        "cell_deg": float(cell_deg),
+        "min_count": int(min_count),
+        "ack_r": float(cell_m),
+    })
+    rows = rs.mappings().all()
 
     return [
-        {"kind": r.kind, "count": int(r.n), "lat": float(r.lat), "lng": float(r.lng)}
+        {
+            "kind": r["kind"],
+            "lat": float(r["lat"]),
+            "lng": float(r["lng"]),
+            "radius_m": int(cell_m),
+            "count": int(r["count"]),
+        }
         for r in rows
     ]
 
