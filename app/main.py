@@ -103,6 +103,38 @@ app.add_middleware(
     max_age=86400,
 )
 
+from fastapi import Request, Response
+
+# Répondre aux préflights sur TOUTES les routes (parachute)
+@app.options("/{path:path}")
+async def any_options_preflight(request: Request, path: str):
+    origin = request.headers.get("origin") or ""
+    # autorise ton domaine prod + localhost + previews netlify via regex déjà posée
+    allowed = set({
+        "https://ayii.netlify.app",
+        "http://localhost:3000",
+    })
+    extra = (os.getenv("ALLOWED_ORIGINS") or "").strip()
+    if extra:
+        for o in extra.split(","):
+            o = o.strip()
+            if o:
+                allowed.add(o)
+
+    resp = Response(status_code=200)
+    # si origin connu → renvoie l’origin, sinon "*" (pour tester)
+    if origin in allowed:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+    else:
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    req_hdrs = request.headers.get("Access-Control-Request-Headers", "")
+    resp.headers["Access-Control-Allow-Headers"] = req_hdrs or "*"
+    resp.headers["Access-Control-Max-Age"] = "86400"
+    return resp
+
 # -----------------------------------------------------------------------------
 # Fichiers statiques
 # -----------------------------------------------------------------------------
