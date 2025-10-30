@@ -90,7 +90,10 @@ ALERT_WINDOW_H   = int(os.getenv("ALERT_WINDOW_H", "3"))     # fenêtre de temps
 ALERT_THRESHOLD  = int(os.getenv("ALERT_THRESHOLD", "3"))    # nb min de signalements pour une zone
 RESPONDER_TOKEN  = (os.getenv("RESPONDER_TOKEN") or "").strip()  # jeton simple pour “pompiers”
 
-
+ALLOWED_KINDS = {
+    "traffic","accident","fire","flood","power","water",
+    "assault","weapon","medical"  # nouveaux types incidents
+}
 # --------- Helpers ----------
 def _to_uuid_or_none(val: Optional[str]):
     try:
@@ -618,8 +621,9 @@ async def post_report(
 
     kind = (p.kind or "").lower().strip()
     signal = (p.signal or "").lower().strip()
-    if kind not in {"power","water","traffic","accident","fire","flood"}:
+    if kind not in ALLOWED_KINDS:
         raise HTTPException(400, "invalid kind")
+
     if signal not in {"cut","restored"}:
         raise HTTPException(400, "invalid signal")
 
@@ -1532,8 +1536,9 @@ async def attachments_near(
     db: AsyncSession = Depends(get_db),
 ):
     k = (kind or "").strip().lower()
-    if k not in {"traffic", "accident", "fire", "flood", "power", "water"}:
+    if k not in ALLOWED_KINDS:
         raise HTTPException(status_code=400, detail="invalid kind")
+
 
     # --- admin ? (via x-admin-token) ---
     is_admin = False
@@ -1825,8 +1830,9 @@ async def alert_zones(
     db: AsyncSession = Depends(get_db),
 ):
     k = (kind or "").strip().lower()
-    if k not in {"traffic","accident","fire","flood","power","water"}:
+    if k not in ALLOWED_KINDS:
         raise HTTPException(status_code=400, detail="invalid kind")
+
 
     # ~150 m → degrés
     cell_deg = max(0.0003, min(0.01, cell_m / 111_000.0))

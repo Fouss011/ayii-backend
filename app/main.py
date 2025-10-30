@@ -192,11 +192,11 @@ from app.routes.map import router as map_router         # noqa: E402
 app.include_router(map_router)
 
 # Route de report (si séparée)
-try:
-    from app.routes.report_simple import router as report_router  # noqa: E402
-    app.include_router(report_router)
-except Exception:
-    pass
+# try:
+#    from app.routes.report_simple import router as report_router  # noqa: E402
+#    app.include_router(report_router)
+#except Exception:
+#    pass
 
 # CTA (protégé par x-admin-token)
 # CTA (protégé par x-admin-token) — inclure après app = FastAPI(...)
