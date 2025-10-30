@@ -389,12 +389,13 @@ async def fetch_incidents_all(db: AsyncSession, limit: int = 2000):
     ]
 
 # --- Helper pour /map : zones d’alerte via cluster DBSCAN ---
+
+# --- Helper pour /map : zones d’alerte via cluster DBSCAN ---
 async def fetch_alert_zones(db: AsyncSession, lat: float, lng: float, r_m: float):
     """
-    Regroupe les reports 'cut' récents par proximité (DBSCAN-like) et renvoie
-    des clusters {kind, count, lat, lng} prêts pour la carte.
-    Utilise les constantes : ALERT_RADIUS_M, ALERT_WINDOW_H, ALERT_THRESHOLD.
-    Exclut les zones où un ack (prise en charge) existe à proximité.
+    Regroupe les reports 'cut' récents par proximité (DBSCAN-like)
+    et renvoie des clusters {kind, count, lat, lng} prêts pour la carte.
+    Compatible avec tous les types (incidents + outages).
     """
     window_min = int(ALERT_WINDOW_H) * 60  # passer heures -> minutes
     group_radius_m = float(ALERT_RADIUS_M)
@@ -414,6 +415,7 @@ async def fetch_alert_zones(db: AsyncSession, lat: float, lng: float, r_m: float
           WHERE created_at > NOW() - INTERVAL '{window_min} minutes'
             AND LOWER(TRIM(signal::text))='cut'
             AND ST_DWithin((geom::geography), (SELECT g FROM me), :r)
+            AND kind IN ('traffic','accident','fire','flood','power','water','assault','weapon','medical')
         ),
         clus AS (
           SELECT
@@ -459,7 +461,7 @@ async def fetch_alert_zones(db: AsyncSession, lat: float, lng: float, r_m: float
     params = {
         "lat": float(lat),
         "lng": float(lng),
-        "r":   float(r_m),
+        "r": float(r_m),
         "eps": group_radius_m,
         "threshold": threshold,
         "ack_r": group_radius_m,
@@ -469,14 +471,15 @@ async def fetch_alert_zones(db: AsyncSession, lat: float, lng: float, r_m: float
         res = await db.execute(sql, params)
         rows = res.fetchall()
     except Exception as e:
-        # Reste robuste : en cas d'erreur SQL, renvoie zéro zone
         await db.rollback()
+        print(f"⚠️ fetch_alert_zones SQL error: {e}")
         return []
 
     return [
         {"kind": r.kind, "count": int(r.n), "lat": float(r.lat), "lng": float(r.lng)}
         for r in rows
     ]
+
 
 
 
