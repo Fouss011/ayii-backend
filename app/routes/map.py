@@ -1,4 +1,8 @@
 # app/routes/map.py
+# (optionnel) """Docstring module..."""
+
+from __future__ import annotations  # ← doit être tout en haut
+
 from fastapi import (
     APIRouter, Depends, HTTPException, Query, Response, Request, Header,
     UploadFile, File, Form, Body
@@ -9,15 +13,18 @@ from sqlalchemy import text
 from typing import Optional, Any, List
 from uuid import UUID
 from datetime import datetime, timezone
-import os, uuid, mimetypes, io, csv, json
+import os, uuid, mimetypes, io, csv, json, time
 
 from app.db import get_db
 from app.config import BASE_PUBLIC_URL, STATIC_DIR, STATIC_URL_PATH  # constants only (no circular import)
 
 router = APIRouter()
 
+# Si Python < 3.10, dé-commente la ligne suivante et remplace l’annotation de _signed_cache plus bas
+# from typing import Dict, Tuple
+
+# ---- Supabase URL signer ----
 async def _supabase_sign_url(public_or_path: str, expires_sec: int = 300) -> str | None:
-    import os
     supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
     supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
     bucket = os.getenv("SUPABASE_BUCKET", "attachments")
@@ -48,13 +55,14 @@ async def _supabase_sign_url(public_or_path: str, expires_sec: int = 300) -> str
         signedURL = data.get("signedURL") or data.get("signedUrl")
         if not signedURL:
             return None
-        # normalisation anti "//"
         return (f"{supa_url}/storage/v1/{signedURL}").replace("/storage/v1//", "/storage/v1/")
     except Exception:
         return None
 
-import time
+# Si Python ≥ 3.10
 _signed_cache: dict[str, tuple[float, str]] = {}  # url -> (expires_at, signed_url)
+# Si Python < 3.10, utilise plutôt :
+# _signed_cache: Dict[str, Tuple[float, str]] = {}
 
 async def get_signed_cached(url: str, cache_ttl: int = 60, link_ttl_sec: int = 300) -> str | None:
     now = time.time()
@@ -65,7 +73,6 @@ async def get_signed_cached(url: str, cache_ttl: int = 60, link_ttl_sec: int = 3
     if signed:
         _signed_cache[url] = (now + cache_ttl, signed)
     return signed
-
 
 
 # --------- Config ----------
@@ -845,7 +852,7 @@ async def upload_image(
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
-    # --- sécurité admin simple (on garde ta logique)
+    # --- Admin simple (header x-admin-token)
     is_admin = False
     try:
         admin_hdr = (request.headers.get("x-admin-token") or "").strip()
@@ -855,15 +862,30 @@ async def upload_image(
         pass
 
     K = (kind or "").strip().lower()
-    if K not in {"traffic", "accident", "fire", "flood", "power", "water"}:
-        raise HTTPException(status_code=400, detail="invalid kind")
+    if K not in ALLOWED_KINDS:
+         raise HTTPException(status_code=400, detail="invalid kind")
 
-    # lecture du contenu
+
+    # --- lecture du fichier
     data = await file.read()
-    if not data or len(data) > 15 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="file too large or empty")
+    if not data:
+        raise HTTPException(status_code=400, detail="empty file")
 
-    # idempotency
+    ctype = (file.content_type or "").lower().strip()
+    is_image = ctype.startswith("image/")
+    is_video = ctype.startswith("video/")
+
+    if not (is_image or is_video):
+        # accepte uniquement image/* ou video/* (webm/mp4)
+        raise HTTPException(status_code=415, detail=f"unsupported content-type: {ctype or 'unknown'}")
+
+    # bornes de taille : image 15Mo, vidéo 50Mo
+    if is_image and len(data) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="image too large")
+    if is_video and len(data) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="video too large")
+
+    # --- idempotency
     idem = (idempotency_key or "").strip() or None
     if idem:
         q = text("SELECT id, url FROM attachments WHERE idempotency_key = :k LIMIT 1")
@@ -873,12 +895,11 @@ async def upload_image(
             return {
                 "ok": True,
                 "id": str(row.id),
-                # Ne renvoyer l’URL qu’aux admins (privacy)
-                "url": row.url if is_admin else None,
-                "idempotency_key": idem
+                "url": row.url if is_admin else None,  # ne montre l'URL qu'à l’admin
+                "idempotency_key": idem,
             }
 
-    # --- Ownership check si pas admin (on garde ta règle)
+    # --- Ownership check : si pas admin, l'uploader doit avoir un report récent proche
     if not is_admin:
         if not user_id:
             raise HTTPException(status_code=403, detail="not_owner")
@@ -887,7 +908,7 @@ async def upload_image(
             SELECT 1
               FROM reports
              WHERE user_id = :uid
-               AND LOWER(TRIM(kind::text)) = :k
+               AND LOWER(TRIM(kind::text))   = :k
                AND LOWER(TRIM(signal::text)) = 'cut'
                AND created_at > NOW() - INTERVAL '48 hours'
                AND ST_DWithin((geom::geography),(SELECT g FROM me),150)
@@ -897,44 +918,55 @@ async def upload_image(
         if rs.first() is None:
             raise HTTPException(status_code=403, detail="not_owner")
 
-    # --- stockage (Supabase si config, sinon local) — on garde ta base, avec 2 petites améliorations
+    # --- choix extension/filename
+    ext = ".jpg"
+    if is_video:
+        if "mp4" in ctype:
+            ext = ".mp4"
+        elif "webm" in ctype:
+            ext = ".webm"
+        else:
+            ext = ".mp4"
+    else:
+        if "jpeg" in ctype:
+            ext = ".jpg"
+        elif "png" in ctype:
+            ext = ".png"
+        elif "webp" in ctype:
+            ext = ".webp"
+        else:
+            ext = ".jpg"
+
+    # --- stockage Supabase (si configuré) sinon local
     url_public = None
+    bucket   = os.getenv("SUPABASE_BUCKET", "attachments")
+    supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
+
     try:
-        bucket = os.getenv("SUPABASE_BUCKET", "attachments")
-        filename = f"{K}_{uuid.uuid4()}.jpg"
-
-        supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
-        # compat: SERVICE_ROLE ou SERVICE_KEY
-        supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
-
         if supa_url and supa_key:
-            # Upload direct via API HTTP (léger et fiable en prod)
-            import httpx, time as _time
-            path = f"{K}/{int(_time.time())}-{filename}"
+            import httpx
+            path = f"{K}/{int(time.time())}-{uuid.uuid4()}{ext}"
             upload_url = f"{supa_url}/storage/v1/object/{bucket}/{path}"
             headers = {
                 "Authorization": f"Bearer {supa_key}",
-                "Content-Type": file.content_type or "image/jpeg",
+                "Content-Type": ctype or ("video/mp4" if is_video else "image/jpeg"),
                 "x-upsert": "false",
             }
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(upload_url, headers=headers, content=data)
-                if r.status_code not in (200, 201):
-                    raise HTTPException(500, f"supabase upload failed [{r.status_code}]: {r.text}")
-            # URL publique (bucket public). Si bucket privé, on passera aux URLs signées plus tard.
+            if r.status_code not in (200, 201):
+                raise HTTPException(status_code=502, detail=f"supabase upload failed: {r.status_code}")
             url_public = f"{supa_url}/storage/v1/object/public/{bucket}/{path}"
         else:
-            # Fallback local (/static) — utile en dev local seulement
+            # local /static (dev)
             os.makedirs(STATIC_DIR, exist_ok=True)
-            disk_path = os.path.join(STATIC_DIR, filename)
+            path = f"{K}-{uuid.uuid4()}{ext}"
+            disk_path = os.path.join(STATIC_DIR, path)
             with open(disk_path, "wb") as fp:
                 fp.write(data)
-            base = BASE_PUBLIC_URL or ""
-            if base:
-                url_public = f"{base}{STATIC_URL_PATH}/{filename}"
-            else:
-                url_public = f"{STATIC_URL_PATH}/{filename}"
-
+            base = (BASE_PUBLIC_URL or "").rstrip("/")
+            url_public = f"{base}{STATIC_URL_PATH}/{path}" if base else f"{STATIC_URL_PATH}/{path}"
     except HTTPException:
         raise
     except Exception as e:
@@ -943,23 +975,23 @@ async def upload_image(
     if not url_public:
         raise HTTPException(status_code=500, detail="no_public_url")
 
-    # --- insert DB (GEOGRAPHY + flags privacy) — petites améliorations
+    # --- insert DB
     ins = text("""
-      INSERT INTO attachments (
-        kind, geom, user_id, url, idempotency_key, created_at,
-        is_sensitive, uploader_id
-      )
-      VALUES (
-        :k,
-        ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-        :uid,
-        :url,
-        :idem,
-        NOW(),
-        TRUE,                         -- par défaut sensible (privacy first)
-        :uploader
-      )
-      RETURNING id
+        INSERT INTO attachments (
+            kind, geom, user_id, url, idempotency_key, created_at,
+            is_sensitive, uploader_id
+        )
+        VALUES (
+            :k,
+            ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+            :uid,
+            :url,
+            :idem,
+            NOW(),
+            TRUE,
+            :uploader
+        )
+        RETURNING id
     """)
     rs = await db.execute(
         ins,
@@ -970,19 +1002,19 @@ async def upload_image(
             "uid": str(user_id) if user_id else None,
             "url": url_public,
             "idem": idem,
-            "uploader": str(user_id) if user_id else None
+            "uploader": str(user_id) if user_id else None,
         },
     )
-    row = rs.first()
+    new_id = rs.scalar() if hasattr(rs, "scalar") else (rs.first().id if rs.first() else None)
     await db.commit()
 
     return {
         "ok": True,
-        "id": str(row.id),
-        # on ne renvoie l'URL qu'aux admins (évite fuite publique)
-        "url": url_public if is_admin else None,
-        "idempotency_key": idem
+        "id": str(new_id) if new_id else None,
+        "url": url_public if is_admin else None,  # L’URL n’est renvoyée qu’à l’admin
+        "idempotency_key": idem,
     }
+
 
 
 
