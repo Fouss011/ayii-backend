@@ -138,6 +138,172 @@ async def options_upload_image():
     resp.headers["Vary"] = "Origin"
     return resp
 
+# === UPLOAD VIDEO (séparé de l’upload d’image) ============================
+@router.post("/upload_video")
+async def upload_video(
+    kind: str = Form(...),
+    lat: float = Form(...),
+    lng: float = Form(...),
+    user_id: Optional[UUID] = Form(None),
+    idempotency_key: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload d’une petite vidéo (ex: 10s) liée à un incident.
+    Même logique que /upload_image mais on accepte video/* et on augmente un peu la taille.
+    """
+    import os, uuid, time as _time
+    from sqlalchemy import text
+
+    # --- check admin
+    is_admin = False
+    try:
+      admin_hdr = (request.headers.get("x-admin-token") or "").strip()
+      if admin_hdr and admin_hdr == (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or ""):
+          is_admin = True
+    except Exception:
+      pass
+
+    K = (kind or "").strip().lower()
+    if K not in {"traffic","accident","fire","flood","power","water","assault","weapon","medical"}:
+        raise HTTPException(status_code=400, detail="invalid kind")
+
+    # lecture contenu
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty file")
+
+    # 40 Mo max pour une courte vidéo
+    if len(data) > 40 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="video too large")
+
+    # idempotency
+    idem = (idempotency_key or "").strip() or None
+    if idem:
+        q = text("SELECT id, url FROM attachments WHERE idempotency_key = :k LIMIT 1")
+        rs = await db.execute(q, {"k": idem})
+        row = rs.first()
+        if row:
+            return {
+                "ok": True,
+                "id": str(row.id),
+                "url": row.url if is_admin else None,
+                "idempotency_key": idem,
+            }
+
+    # --- ownership check si pas admin
+    if not is_admin:
+        if not user_id:
+            raise HTTPException(status_code=403, detail="not_owner")
+        chk = text("""
+            WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+            SELECT 1
+              FROM reports
+             WHERE user_id = :uid
+               AND LOWER(TRIM(kind::text)) = :k
+               AND LOWER(TRIM(signal::text)) = 'cut'
+               AND created_at > NOW() - INTERVAL '48 hours'
+               AND ST_DWithin((geom::geography),(SELECT g FROM me),150)
+             LIMIT 1
+        """)
+        rs = await db.execute(
+            chk,
+            {"uid": str(user_id), "k": K, "lat": lat, "lng": lng},
+        )
+        if rs.first() is None:
+            raise HTTPException(status_code=403, detail="not_owner")
+
+    # --- stockage supabase / local
+    url_public = None
+    try:
+        bucket = os.getenv("SUPABASE_BUCKET", "attachments")
+        supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+        supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
+
+        # on récupère l’extension/mime
+        filename_orig = file.filename or f"{K}_{uuid.uuid4().hex}.webm"
+        # on évite les noms bizarres
+        if "." not in filename_orig:
+            filename_orig = filename_orig + ".webm"
+        path = f"{K}/{int(_time.time())}-{uuid.uuid4().hex}-{os.path.basename(filename_orig)}"
+
+        if supa_url and supa_key:
+            import httpx
+            upload_url = f"{supa_url}/storage/v1/object/{bucket}/{path}"
+            headers = {
+                "Authorization": f"Bearer {supa_key}",
+                "Content-Type": file.content_type or "video/webm",
+                "x-upsert": "false",
+            }
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(upload_url, headers=headers, content=data)
+                if r.status_code not in (200, 201):
+                    raise HTTPException(500, f"supabase upload failed [{r.status_code}]: {r.text}")
+            url_public = f"{supa_url}/storage/v1/object/public/{bucket}/{path}"
+        else:
+            # fallback local
+            os.makedirs(STATIC_DIR, exist_ok=True)
+            disk_path = os.path.join(STATIC_DIR, os.path.basename(path))
+            with open(disk_path, "wb") as fp:
+                fp.write(data)
+            base = BASE_PUBLIC_URL or ""
+            if base:
+                url_public = f"{base}{STATIC_URL_PATH}/{os.path.basename(path)}"
+            else:
+                url_public = f"{STATIC_URL_PATH}/{os.path.basename(path)}"
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"storage_error: {e}")
+
+    if not url_public:
+        raise HTTPException(status_code=500, detail="no_public_url")
+
+    # --- insert DB
+    ins = text("""
+      INSERT INTO attachments (
+        kind, geom, user_id, url, idempotency_key, created_at,
+        is_sensitive, uploader_id, mime_type
+      )
+      VALUES (
+        :k,
+        ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+        :uid,
+        :url,
+        :idem,
+        NOW(),
+        TRUE,
+        :uploader,
+        :mime
+      )
+      RETURNING id
+    """)
+    rs = await db.execute(
+        ins,
+        {
+            "k": K,
+            "lng": float(lng),
+            "lat": float(lat),
+            "uid": str(user_id) if user_id else None,
+            "url": url_public,
+            "idem": idem,
+            "uploader": str(user_id) if user_id else None,
+            "mime": file.content_type or "video/webm",
+        },
+    )
+    row = rs.first()
+    await db.commit()
+
+    return {
+        "ok": True,
+        "id": str(row.id),
+        "url": url_public if is_admin else None,
+        "idempotency_key": idem,
+    }
+
+
 # --------- Upload vers Supabase Storage ----------
 async def _upload_to_supabase(file_bytes: bytes, filename: str, content_type: str) -> str:
     SUPA_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
