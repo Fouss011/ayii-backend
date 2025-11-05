@@ -1731,8 +1731,8 @@ async def attachments_near(
     lng: float = Query(..., ge=-180, le=180),
     radius_m: int = Query(150, ge=10, le=2000),
     hours: int = Query(48, ge=1, le=168),
-    viewer_user_id: Optional[UUID] = Query(None, description="Permet à l'auteur de voir sa propre image"),
-    debug: int = Query(0, description="1 pour renvoyer les erreurs détaillées"),
+    viewer_user_id: Optional[UUID] = Query(None, description="optionnel"),
+    debug: int = Query(0, description="1 pour détailler les erreurs"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
@@ -1740,99 +1740,71 @@ async def attachments_near(
     if k not in ALLOWED_KINDS:
         raise HTTPException(status_code=400, detail="invalid kind")
 
-    # admin ?
-    is_admin = False
     try:
-        admin_hdr = (request.headers.get("x-admin-token") or "").strip()
-        tok = (os.getenv("ADMIN_TOKEN") or "").strip()
-        is_admin = bool(tok) and admin_hdr == tok
-    except Exception:
-        pass
-
-    try:
+        # on récupère TOUT ce qui est proche (images + vidéos)
         rs = await db.execute(
             text("""
                 WITH me AS (
                     SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
                 )
-                SELECT id,
-                       url,
-                       mime_type,
-                       ST_Y(geom::geometry) AS lat,
-                       ST_X(geom::geometry) AS lng,
-                       user_id,
-                       created_at
-                  FROM attachments
-                 WHERE LOWER(TRIM(kind::text)) = :k
-                   AND created_at > NOW() - (:hours * INTERVAL '1 hour')
-                   AND ST_DWithin(geom::geography, (SELECT g FROM me), :r)
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 200
+                SELECT
+                    id,
+                    url,
+                    mime_type,
+                    ST_Y(geom::geometry) AS lat,
+                    ST_X(geom::geometry) AS lng,
+                    user_id,
+                    created_at
+                FROM attachments
+                WHERE LOWER(TRIM(kind::text)) = :k
+                  AND created_at > NOW() - (:hours * INTERVAL '1 hour')
+                  AND ST_DWithin(geom::geography, (SELECT g FROM me), :r)
+                ORDER BY created_at DESC, id DESC
+                LIMIT 200
             """),
-            {"k": k, "lng": lng, "lat": lat, "r": radius_m, "hours": int(hours)},
+            {
+                "k": k,
+                "lng": float(lng),
+                "lat": float(lat),
+                "r": int(radius_m),
+                "hours": int(hours),
+            },
         )
         rows = rs.mappings().all()
 
-        # est-ce que le viewer est bien l'auteur ?
-        owner_ok = False
-        if (not is_admin) and viewer_user_id:
-            chk = await db.execute(
-                text("""
-                    WITH me AS (
-                        SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-                    )
-                    SELECT 1
-                      FROM reports
-                     WHERE user_id = :uid
-                       AND LOWER(TRIM(kind::text))   = :k
-                       AND LOWER(TRIM(signal::text)) = 'cut'
-                       AND created_at > NOW() - (:hours * INTERVAL '1 hour')
-                       AND ST_DWithin(geom::geography, (SELECT g FROM me), :r)
-                     LIMIT 1
-                """),
-                {"uid": str(viewer_user_id), "k": k, "lng": lng, "lat": lat, "r": radius_m, "hours": int(hours)},
-            )
-            owner_ok = (chk.first() is not None)
-
         out = []
         for r in rows:
-            # on essaie de signer l’URL seulement si on peut la montrer
-            signed = None
-            if (is_admin or owner_ok) and r.get("url"):
-                try:
-                    signed = await get_signed_cached(r["url"], cache_ttl=60, link_ttl_sec=300)
-                except Exception:
-                    if debug:
-                        signed = None
+            raw_url = r.get("url")
+            final_url = None
 
-            if is_admin or owner_ok:
-                out.append({
-                    "id": str(r["id"]),
-                    "lat": float(r["lat"]),
-                    "lng": float(r["lng"]),
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                    "url": r["url"],
-                    "mime_type": r.get("mime_type"),
-                    "uploader_id": str(r["user_id"]) if r["user_id"] else None,
-                })
-            else:
-                # on masque l’URL si pas autorisé
-                out.append({
-                    "id": str(r["id"]),
-                    "lat": float(r["lat"]),
-                    "lng": float(r["lng"]),
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                    "url": None,
-                    "mime_type": r.get("mime_type"),
-                    "note": "📷 Média réservé à l'auteur ou aux secours",
-                })
+            if raw_url:
+                # on ESSAIE de signer
+                try:
+                    signed = await get_signed_cached(raw_url, cache_ttl=60, link_ttl_sec=300)
+                    # si la signature échoue → on garde l’URL brute
+                    final_url = signed or raw_url
+                except Exception as e:
+                    if debug:
+                        print("attachments_near sign error:", e)
+                    final_url = raw_url
+
+            out.append({
+                "id": str(r["id"]),
+                "lat": float(r["lat"]),
+                "lng": float(r["lng"]),
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "url": final_url,                              # ✅ toujours une URL
+                "mime_type": r.get("mime_type") or "",         # "image/jpeg", "video/mp4", ...
+                "uploader_id": str(r["user_id"]) if r["user_id"] else None,
+            })
 
         return out
 
     except Exception as e:
         if debug:
             raise HTTPException(status_code=500, detail=f"attachments_near error: {e}")
-        raise HTTPException(status_code=500, detail="attachments_near failed")
+        raise HTTPException(status_code=500, detail="attachments_near error")
+
 
 
 # --- Agrégations CSV (reports/events) ---
