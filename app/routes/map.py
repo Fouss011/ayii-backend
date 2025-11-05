@@ -1731,8 +1731,8 @@ async def attachments_near(
     lng: float = Query(..., ge=-180, le=180),
     radius_m: int = Query(150, ge=10, le=2000),
     hours: int = Query(48, ge=1, le=168),
-    viewer_user_id: Optional[UUID] = Query(None, description="optionnel"),
-    debug: int = Query(0, description="1 pour détailler les erreurs"),
+    viewer_user_id: Optional[UUID] = Query(None, description="Permet à l'auteur de voir sa propre image"),
+    debug: int = Query(0, description="1 pour renvoyer les erreurs détaillées"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
@@ -1740,8 +1740,17 @@ async def attachments_near(
     if k not in ALLOWED_KINDS:
         raise HTTPException(status_code=400, detail="invalid kind")
 
+    # admin ?
+    is_admin = False
     try:
-        # on récupère TOUT ce qui est proche (images + vidéos)
+        admin_hdr = (request.headers.get("x-admin-token") or "").strip()
+        tok = (os.getenv("ADMIN_TOKEN") or "").strip()
+        is_admin = bool(tok) and admin_hdr == tok
+    except Exception:
+        pass
+
+    try:
+        # 1) on récupère les pièces jointes proches
         rs = await db.execute(
             text("""
                 WITH me AS (
@@ -1750,7 +1759,6 @@ async def attachments_near(
                 SELECT
                     id,
                     url,
-                    mime_type,
                     ST_Y(geom::geometry) AS lat,
                     ST_X(geom::geometry) AS lng,
                     user_id,
@@ -1762,41 +1770,89 @@ async def attachments_near(
                 ORDER BY created_at DESC, id DESC
                 LIMIT 200
             """),
-            {
-                "k": k,
-                "lng": float(lng),
-                "lat": float(lat),
-                "r": int(radius_m),
-                "hours": int(hours),
-            },
+            {"k": k, "lng": lng, "lat": lat, "r": radius_m, "hours": int(hours)},
         )
         rows = rs.mappings().all()
 
+        # 2) est-ce que le viewer est bien l'auteur d'un report proche ?
+        owner_ok = False
+        if (not is_admin) and viewer_user_id:
+            chk = await db.execute(
+                text("""
+                    WITH me AS (
+                        SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+                    )
+                    SELECT 1
+                      FROM reports
+                     WHERE user_id = :uid
+                       AND LOWER(TRIM(kind::text))   = :k
+                       AND LOWER(TRIM(signal::text)) = 'cut'
+                       AND created_at > NOW() - (:hours * INTERVAL '1 hour')
+                       AND ST_DWithin(geom::geography, (SELECT g FROM me), :r)
+                     LIMIT 1
+                """),
+                {
+                    "uid": str(viewer_user_id),
+                    "k": k,
+                    "lng": lng,
+                    "lat": lat,
+                    "r": radius_m,
+                    "hours": int(hours),
+                },
+            )
+            owner_ok = (chk.first() is not None)
+
         out = []
         for r in rows:
-            raw_url = r.get("url")
-            final_url = None
+            raw_url = r["url"]
+            signed = None
 
-            if raw_url:
-                # on ESSAIE de signer
+            # on essaie de signer seulement si on a le droit de voir
+            if raw_url and (is_admin or owner_ok):
                 try:
                     signed = await get_signed_cached(raw_url, cache_ttl=60, link_ttl_sec=300)
-                    # si la signature échoue → on garde l’URL brute
-                    final_url = signed or raw_url
-                except Exception as e:
+                except Exception:
                     if debug:
-                        print("attachments_near sign error:", e)
-                    final_url = raw_url
+                        signed = None
 
-            out.append({
-                "id": str(r["id"]),
-                "lat": float(r["lat"]),
-                "lng": float(r["lng"]),
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                "url": final_url,                              # ✅ toujours une URL
-                "mime_type": r.get("mime_type") or "",         # "image/jpeg", "video/mp4", ...
-                "uploader_id": str(r["user_id"]) if r["user_id"] else None,
-            })
+            # on essaie de deviner le type juste pour le front
+            guessed_mime = None
+            final_url = signed if (signed is not None) else (raw_url if (is_admin or owner_ok) else None)
+            if final_url:
+                low = final_url.lower()
+                if low.endswith(".jpg") or low.endswith(".jpeg"):
+                    guessed_mime = "image/jpeg"
+                elif low.endswith(".png"):
+                    guessed_mime = "image/png"
+                elif low.endswith(".webp"):
+                    guessed_mime = "image/webp"
+                elif low.endswith(".mp4"):
+                    guessed_mime = "video/mp4"
+                elif low.endswith(".webm"):
+                    guessed_mime = "video/webm"
+
+            if is_admin or owner_ok:
+                out.append({
+                    "id": str(r["id"]),
+                    "kind": k,
+                    "lat": float(r["lat"]),
+                    "lng": float(r["lng"]),
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "url": final_url,
+                    "mime_type": guessed_mime,
+                    "uploader_id": str(r["user_id"]) if r["user_id"] else None,
+                })
+            else:
+                # pas le droit → on masque l’URL
+                out.append({
+                    "id": str(r["id"]),
+                    "kind": k,
+                    "lat": float(r["lat"]),
+                    "lng": float(r["lng"]),
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "url": None,
+                    "note": "📷 Média réservé à l'auteur ou à l'admin",
+                })
 
         return out
 
