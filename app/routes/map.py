@@ -1740,18 +1740,16 @@ async def attachments_near(
     if k not in ALLOWED_KINDS:
         raise HTTPException(status_code=400, detail="invalid kind")
 
-
-    # --- admin ? (via x-admin-token) ---
+    # admin ?
     is_admin = False
     try:
         admin_hdr = (request.headers.get("x-admin-token") or "").strip()
-        tok = (os.getenv("ADMIN_TOKEN") or "").strip()   # ← NE PAS lire NEXT_PUBLIC_ADMIN_TOKEN
+        tok = (os.getenv("ADMIN_TOKEN") or "").strip()
         is_admin = bool(tok) and admin_hdr == tok
     except Exception:
         pass
 
     try:
-        # --- attachments proches (pas de signature ici) ---
         rs = await db.execute(
             text("""
                 WITH me AS (
@@ -1759,6 +1757,7 @@ async def attachments_near(
                 )
                 SELECT id,
                        url,
+                       mime_type,
                        ST_Y(geom::geometry) AS lat,
                        ST_X(geom::geometry) AS lng,
                        user_id,
@@ -1774,7 +1773,7 @@ async def attachments_near(
         )
         rows = rs.mappings().all()
 
-        # --- vérif "auteur" si pas admin ---
+        # est-ce que le viewer est bien l'auteur ?
         owner_ok = False
         if (not is_admin) and viewer_user_id:
             chk = await db.execute(
@@ -1797,13 +1796,12 @@ async def attachments_near(
 
         out = []
         for r in rows:
-            # Signature seulement si admin ou auteur autorisé
+            # on essaie de signer l’URL seulement si on peut la montrer
             signed = None
             if (is_admin or owner_ok) and r.get("url"):
                 try:
                     signed = await get_signed_cached(r["url"], cache_ttl=60, link_ttl_sec=300)
                 except Exception:
-                    # En debug, expose l'erreur de signature pour diagnostiquer
                     if debug:
                         signed = None
 
@@ -1813,31 +1811,28 @@ async def attachments_near(
                     "lat": float(r["lat"]),
                     "lng": float(r["lng"]),
                     "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                    "url": signed,  # lien signé Supabase
+                    "url": signed or r["url"],
+                    "mime_type": r.get("mime_type"),
                     "uploader_id": str(r["user_id"]) if r["user_id"] else None,
-                    "is_sensitive": True,
                 })
             else:
+                # on masque l’URL si pas autorisé
                 out.append({
                     "id": str(r["id"]),
                     "lat": float(r["lat"]),
                     "lng": float(r["lng"]),
                     "created_at": r["created_at"].isoformat() if r["created_at"] else None,
                     "url": None,
-                    "note": "📷 Image réservée à l'auteur ou aux secours",
+                    "mime_type": r.get("mime_type"),
+                    "note": "📷 Média réservé à l'auteur ou aux secours",
                 })
 
         return out
 
     except Exception as e:
         if debug:
-            # renvoie l'erreur pour débug rapide
             raise HTTPException(status_code=500, detail=f"attachments_near error: {e}")
-        # sinon, 500 standard
-        raise
-
-
-
+        raise HTTPException(status_code=500, detail="attachments_near failed")
 
 
 # --- Agrégations CSV (reports/events) ---
