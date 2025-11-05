@@ -1811,7 +1811,7 @@ async def attachments_near(
                     "lat": float(r["lat"]),
                     "lng": float(r["lng"]),
                     "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                    "url": signed or r["url"],
+                    "url": r["url"],
                     "mime_type": r.get("mime_type"),
                     "uploader_id": str(r["user_id"]) if r["user_id"] else None,
                 })
