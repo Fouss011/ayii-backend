@@ -306,9 +306,10 @@ async def upload_video(
     return {
         "ok": True,
         "id": str(row.id),
-        "url": url_public if is_admin else None,
+        "url": url_public,  # on renvoie toujours l’URL en phase de test
         "idempotency_key": idem,
     }
+
 
 
 # --------- Upload vers Supabase Storage ----------
