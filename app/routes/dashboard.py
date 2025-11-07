@@ -128,16 +128,35 @@ async def dashboard_page():
     }
 
     function buildThumbHTML(item){
-      const icon=iconKind(item.kind);
-      const url=item.photo_url||'';
-      return `
-        <div class="thumbbox">
-          <div class="icon">${icon}</div>
-          ${url ? `<img class="thumb" src="${url}" alt="${item.kind||''}"
-                    onload="this.previousElementSibling.style.display='none'"
-                    onerror="this.style.display='none'; this.previousElementSibling.style.display='flex'">` : ``}
-        </div>`;
-    }
+  const icon = iconKind(item.kind);
+  const url  = item.photo_url || "";   // le backend CTA te donne toujours ça
+  const isVideo = url && (
+    url.toLowerCase().endsWith(".mp4") ||
+    url.toLowerCase().endsWith(".webm") ||
+    url.toLowerCase().includes("video")
+  );
+
+  return `
+    <div class="thumbbox">
+      <div class="icon">${icon}</div>
+      ${
+        url
+          ? (
+              isVideo
+                ? `<video class="thumb" src="${url}" controls
+                       onloadeddata="this.previousElementSibling.style.display='none'"
+                       onerror="this.style.display='flex'">
+                   </video>`
+                : `<img class="thumb" src="${url}" alt="${item.kind||''}"
+                       onload="this.previousElementSibling.style.display='none'"
+                       onerror="this.style.display='none'; this.previousElementSibling.style.display='flex'">`
+            )
+          : ``
+      }
+    </div>
+  `;
+}
+
 
     function render(){
       const list=$('#list'); list.innerHTML='';

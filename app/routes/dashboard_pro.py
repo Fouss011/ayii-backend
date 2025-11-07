@@ -205,7 +205,15 @@ async def dashboard_pro():
           <td class="p-2"><span class="pill">${it.status}</span></td>
           <td class="p-2">${fmtAgeMin(it.age_min)}</td>
           <td class="p-2">${severityPill(sev)}</td>
-          <td class="p-2">${it.photo_url ? `<a href="${it.photo_url}" target="_blank" class="text-blue-600 underline">Photo</a>` : `<span class="text-gray-400">—</span>`}</td>
+          <td class="p-2">${
+  it.photo_url
+    ? (/\.(mp4|webm|mov)(\?|$)/i.test(it.photo_url)
+        ? `<a href="${it.photo_url}" target="_blank" class="text-blue-600 underline">Vidéo</a>`
+        : `<a href="${it.photo_url}" target="_blank" class="text-blue-600 underline">Photo</a>`
+      )
+    : `<span class="text-gray-400">—</span>`
+}</td>
+
         </tr>`;
     }).join("");
     $("#incTable").innerHTML = `
