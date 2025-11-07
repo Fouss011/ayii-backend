@@ -1815,17 +1815,23 @@ async def attachments_near(
             raw_url = r["url"]
             signed = None
 
-            # on essaie de signer seulement si on a le droit de voir
+            # on signe seulement si on est admin ou proprio
             if raw_url and (is_admin or owner_ok):
                 try:
-                    signed = await get_signed_cached(raw_url, cache_ttl=60, link_ttl_sec=300)
+                    signed = await get_signed_cached(
+                        raw_url,
+                        cache_ttl=60,
+                        link_ttl_sec=300
+                    )
                 except Exception:
                     if debug:
                         signed = None
 
-            # on essaie de deviner le type juste pour le front
-            guessed_mime = None
+            # URL qu'on va envoyer (préférence pour la signée)
             final_url = signed or raw_url
+
+            # on essaie de deviner le type pour le front
+            guessed_mime = None
             if final_url:
                 low = final_url.lower()
                 if low.endswith(".jpg") or low.endswith(".jpeg"):
@@ -1839,28 +1845,17 @@ async def attachments_near(
                 elif low.endswith(".webm"):
                     guessed_mime = "video/webm"
 
-            if is_admin or owner_ok:
-                out.append({
-                    "id": str(r["id"]),
-                    "kind": k,
-                    "lat": float(r["lat"]),
-                    "lng": float(r["lng"]),
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                    "url": final_url,
-                    "mime_type": guessed_mime,
-                    "uploader_id": str(r["user_id"]) if r["user_id"] else None,
-                })
-            else:
-                # pas le droit → on masque l’URL
-                out.append({
-                    "id": str(r["id"]),
-                    "kind": k,
-                    "lat": float(r["lat"]),
-                    "lng": float(r["lng"]),
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                    "url": None,
-                    "note": "📷 Média réservé à l'auteur ou à l'admin",
-                })
+            # 👉 ICI on ne masque plus, on envoie l’URL même si pas admin/proprio
+            out.append({
+                "id": str(r["id"]),
+                "kind": k,
+                "lat": float(r["lat"]),
+                "lng": float(r["lng"]),
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "url": final_url,
+                "mime_type": guessed_mime,
+                "uploader_id": str(r["user_id"]) if r["user_id"] else None,
+            })
 
         return out
 
@@ -1868,6 +1863,7 @@ async def attachments_near(
         if debug:
             raise HTTPException(status_code=500, detail=f"attachments_near error: {e}")
         raise HTTPException(status_code=500, detail="attachments_near error")
+
 
 
 
