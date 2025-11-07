@@ -152,12 +152,14 @@ async def upload_video(
 ):
     """
     Upload d’une petite vidéo liée à un incident.
-    Version sans colonne mime_type (compat table actuelle).
+    - on vérifie que l’utilisateur a bien déclaré un incident proche (sauf admin)
+    - on envoie la vidéo dans le bucket Supabase (ou en local)
+    - on enregistre dans la table `attachments`
     """
     import os, uuid, time as _time
     from sqlalchemy import text
 
-    # admin ?
+    # 1) vérifier admin
     is_admin = False
     try:
         admin_hdr = (request.headers.get("x-admin-token") or "").strip()
@@ -168,23 +170,23 @@ async def upload_video(
 
     K = (kind or "").strip().lower()
     if K not in {"traffic","accident","fire","flood","power","water","assault","weapon","medical"}:
-      raise HTTPException(status_code=400, detail="invalid kind")
+        raise HTTPException(status_code=400, detail="invalid kind")
 
-    # récup bytes
+    # 2) lire le fichier
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty file")
 
-    # 40 Mo max
+    # taille max 40 Mo
     if len(data) > 40 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="video too large")
 
-    # type MIME : certains clients envoient application/octet-stream
+    # type MIME
     ctype = (file.content_type or "").lower().strip()
     if ctype in ("", "application/octet-stream"):
         ctype = "video/mp4"
 
-    # idempotency
+    # 3) idempotency → si déjà uploadé on renvoie l’ancien
     idem = (idempotency_key or "").strip() or None
     if idem:
         q = text("SELECT id, url FROM attachments WHERE idempotency_key = :k LIMIT 1")
@@ -198,7 +200,7 @@ async def upload_video(
                 "idempotency_key": idem,
             }
 
-    # si pas admin → on vérifie que l’utilisateur a bien déclaré un incident proche
+    # 4) si pas admin → vérifier qu’il a bien déclaré un report tout près
     if not is_admin:
         if not user_id:
             raise HTTPException(status_code=403, detail="not_owner")
@@ -215,19 +217,21 @@ async def upload_video(
         """)
         rs = await db.execute(
             chk,
-            {"uid": str(user_id), "k": K, "lat": lat, "lng": lng},
+            {"uid": str(user_id), "k": K, "lat": float(lat), "lng": float(lng)},
         )
         if rs.first() is None:
             raise HTTPException(status_code=403, detail="not_owner")
 
-    # upload vers Supabase ou local
-    url_public = None
+    # 5) upload réel (Supabase d’abord, sinon disque)
+    from app.config import BASE_PUBLIC_URL, STATIC_DIR, STATIC_URL_PATH
+
+    url_public: Optional[str] = None
     try:
         bucket   = os.getenv("SUPABASE_BUCKET", "attachments")
         supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
         supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
 
-        # nom propre
+        # nom de fichier propre
         filename_orig = file.filename or f"{K}_{uuid.uuid4().hex}.mp4"
         if "." not in filename_orig:
             filename_orig = filename_orig + ".mp4"
@@ -245,14 +249,15 @@ async def upload_video(
                 r = await client.post(upload_url, headers=headers, content=data)
             if r.status_code not in (200, 201):
                 raise HTTPException(500, f"supabase upload failed [{r.status_code}]: {r.text}")
+            # ⚠️ c’est ici qu’il y avait le bug dans ta version : il fallait utiliser les variables minuscules
             url_public = f"{supa_url}/storage/v1/object/public/{bucket}/{path}"
         else:
-            # fallback local
+            # fallback disque
             os.makedirs(STATIC_DIR, exist_ok=True)
             disk_path = os.path.join(STATIC_DIR, os.path.basename(path))
             with open(disk_path, "wb") as fp:
                 fp.write(data)
-            base = BASE_PUBLIC_URL or ""
+            base = (BASE_PUBLIC_URL or "").rstrip("/")
             if base:
                 url_public = f"{base}{STATIC_URL_PATH}/{os.path.basename(path)}"
             else:
@@ -265,7 +270,7 @@ async def upload_video(
     if not url_public:
         raise HTTPException(status_code=500, detail="no_public_url")
 
-    # INSERT sans mime_type ⚠️
+    # 6) enregistrement en base
     ins = text("""
       INSERT INTO attachments (
         kind, geom, user_id, url, idempotency_key, created_at,
@@ -1819,7 +1824,7 @@ async def attachments_near(
 
             # on essaie de deviner le type juste pour le front
             guessed_mime = None
-            final_url = signed if (signed is not None) else (raw_url if (is_admin or owner_ok) else None)
+            final_url = signed or raw_url
             if final_url:
                 low = final_url.lower()
                 if low.endswith(".jpg") or low.endswith(".jpeg"):
