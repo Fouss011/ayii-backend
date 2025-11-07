@@ -151,33 +151,38 @@ async def upload_video(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Upload d’une petite vidéo (ex: 10s) liée à un incident.
-    Même logique que /upload_image mais on accepte video/* et on augmente un peu la taille.
+    Upload d’une petite vidéo liée à un incident.
+    Version sans colonne mime_type (compat table actuelle).
     """
     import os, uuid, time as _time
     from sqlalchemy import text
 
-    # --- check admin
+    # admin ?
     is_admin = False
     try:
-      admin_hdr = (request.headers.get("x-admin-token") or "").strip()
-      if admin_hdr and admin_hdr == (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or ""):
-          is_admin = True
+        admin_hdr = (request.headers.get("x-admin-token") or "").strip()
+        if admin_hdr and admin_hdr == (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or ""):
+            is_admin = True
     except Exception:
-      pass
+        pass
 
     K = (kind or "").strip().lower()
     if K not in {"traffic","accident","fire","flood","power","water","assault","weapon","medical"}:
-        raise HTTPException(status_code=400, detail="invalid kind")
+      raise HTTPException(status_code=400, detail="invalid kind")
 
-    # lecture contenu
+    # récup bytes
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty file")
 
-    # 40 Mo max pour une courte vidéo
+    # 40 Mo max
     if len(data) > 40 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="video too large")
+
+    # type MIME : certains clients envoient application/octet-stream
+    ctype = (file.content_type or "").lower().strip()
+    if ctype in ("", "application/octet-stream"):
+        ctype = "video/mp4"
 
     # idempotency
     idem = (idempotency_key or "").strip() or None
@@ -193,7 +198,7 @@ async def upload_video(
                 "idempotency_key": idem,
             }
 
-    # --- ownership check si pas admin
+    # si pas admin → on vérifie que l’utilisateur a bien déclaré un incident proche
     if not is_admin:
         if not user_id:
             raise HTTPException(status_code=403, detail="not_owner")
@@ -202,7 +207,7 @@ async def upload_video(
             SELECT 1
               FROM reports
              WHERE user_id = :uid
-               AND LOWER(TRIM(kind::text)) = :k
+               AND LOWER(TRIM(kind::text))   = :k
                AND LOWER(TRIM(signal::text)) = 'cut'
                AND created_at > NOW() - INTERVAL '48 hours'
                AND ST_DWithin((geom::geography),(SELECT g FROM me),150)
@@ -215,18 +220,17 @@ async def upload_video(
         if rs.first() is None:
             raise HTTPException(status_code=403, detail="not_owner")
 
-    # --- stockage supabase / local
+    # upload vers Supabase ou local
     url_public = None
     try:
-        bucket = os.getenv("SUPABASE_BUCKET", "attachments")
+        bucket   = os.getenv("SUPABASE_BUCKET", "attachments")
         supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
         supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
 
-        # on récupère l’extension/mime
-        filename_orig = file.filename or f"{K}_{uuid.uuid4().hex}.webm"
-        # on évite les noms bizarres
+        # nom propre
+        filename_orig = file.filename or f"{K}_{uuid.uuid4().hex}.mp4"
         if "." not in filename_orig:
-            filename_orig = filename_orig + ".webm"
+            filename_orig = filename_orig + ".mp4"
         path = f"{K}/{int(_time.time())}-{uuid.uuid4().hex}-{os.path.basename(filename_orig)}"
 
         if supa_url and supa_key:
@@ -234,13 +238,13 @@ async def upload_video(
             upload_url = f"{supa_url}/storage/v1/object/{bucket}/{path}"
             headers = {
                 "Authorization": f"Bearer {supa_key}",
-                "Content-Type": file.content_type or "video/webm",
+                "Content-Type": ctype,
                 "x-upsert": "false",
             }
             async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(upload_url, headers=headers, content=data)
-                if r.status_code not in (200, 201):
-                    raise HTTPException(500, f"supabase upload failed [{r.status_code}]: {r.text}")
+            if r.status_code not in (200, 201):
+                raise HTTPException(500, f"supabase upload failed [{r.status_code}]: {r.text}")
             url_public = f"{supa_url}/storage/v1/object/public/{bucket}/{path}"
         else:
             # fallback local
@@ -261,11 +265,11 @@ async def upload_video(
     if not url_public:
         raise HTTPException(status_code=500, detail="no_public_url")
 
-    # --- insert DB
+    # INSERT sans mime_type ⚠️
     ins = text("""
       INSERT INTO attachments (
         kind, geom, user_id, url, idempotency_key, created_at,
-        is_sensitive, uploader_id, mime_type
+        is_sensitive, uploader_id
       )
       VALUES (
         :k,
@@ -275,8 +279,7 @@ async def upload_video(
         :idem,
         NOW(),
         TRUE,
-        :uploader,
-        :mime
+        :uploader
       )
       RETURNING id
     """)
@@ -290,7 +293,6 @@ async def upload_video(
             "url": url_public,
             "idem": idem,
             "uploader": str(user_id) if user_id else None,
-            "mime": file.content_type or "video/webm",
         },
     )
     row = rs.first()
