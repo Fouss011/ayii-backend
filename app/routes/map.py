@@ -348,6 +348,7 @@ async def upload_video(
 
 
 
+
 # --------- Upload vers Supabase Storage ----------
 async def _upload_to_supabase(file_bytes: bytes, filename: str, content_type: str) -> str:
     SUPA_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
