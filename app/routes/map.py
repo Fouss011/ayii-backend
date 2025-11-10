@@ -24,38 +24,64 @@ router = APIRouter()
 # from typing import Dict, Tuple
 
 # ---- Supabase URL signer ----
-async def _supabase_sign_url(public_or_path: str, expires_sec: int = 300) -> str | None:
-    supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
-    supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
-    bucket = os.getenv("SUPABASE_BUCKET", "attachments")
-    if not (supa_url and supa_key):
-        return None
+import os
+import httpx
 
-    # -> "<bucket>/<path>"
+async def _supabase_sign_url(public_or_path: str, expires_sec: int = 300) -> str | None:
+    """
+    Prend une URL publique Supabase OU juste un chemin, et renvoie une URL signée.
+    Si Supabase n’est pas configuré → None.
+    """
+    supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    supa_key = (
+        os.getenv("SUPABASE_SERVICE_ROLE")
+        or os.getenv("SUPABASE_SERVICE_KEY")
+        or os.getenv("SUPABASE_ANON_KEY")
+    )
+    bucket = os.getenv("SUPABASE_BUCKET", "attachments")
+
+    # si on n'a pas au moins l'URL et une clé → on ne signe pas
+    if not supa_url or not supa_key:
+      # tu peux logger ici si tu veux
+      return None
+
+    # normaliser le chemin à signer
     if "/storage/v1/object/public/" in public_or_path:
+        # on a reçu une URL complète
         try:
             after = public_or_path.split("/storage/v1/object/public/")[1]
         except Exception:
             return None
     else:
+        # on a reçu juste le chemin
         p = public_or_path.strip().lstrip("/")
+        # on s'assure que ça commence par le bucket
         after = p if p.startswith(bucket + "/") else f"{bucket}/{p}"
 
     sign_endpoint = f"{supa_url}/storage/v1/object/sign/{after}"
 
     try:
-        import httpx
-        headers = {"Authorization": f"Bearer {supa_key}", "Content-Type": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {supa_key}",
+            "Content-Type": "application/json",
+        }
         payload = {"expiresIn": int(expires_sec)}
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(sign_endpoint, headers=headers, json=payload)
+
         if r.status_code not in (200, 201):
+            # ici pareil tu peux logger r.text
             return None
+
         data = r.json()
         signedURL = data.get("signedURL") or data.get("signedUrl")
         if not signedURL:
             return None
-        return (f"{supa_url}/storage/v1/{signedURL}").replace("/storage/v1//", "/storage/v1/")
+
+        # on reconstruit une URL complète
+        return (f"{supa_url}/storage/v1/{signedURL}").replace(
+            "/storage/v1//", "/storage/v1/"
+        )
     except Exception:
         return None
 
