@@ -1791,7 +1791,8 @@ async def attachments_near(
     radius_m: int = Query(150, ge=10, le=2000),
     hours: int = Query(48, ge=1, le=168),
     viewer_user_id: Optional[UUID] = Query(
-        None, description="ID de l'utilisateur qui regarde (permet de vérifier s'il est l'auteur)"
+        None,
+        description="ID de l'utilisateur qui regarde (permet de vérifier s'il est l'auteur)",
     ),
     debug: int = Query(0),
     request: Request = None,
@@ -1801,15 +1802,17 @@ async def attachments_near(
     Renvoie les médias proches.
     - admin → voit tout
     - auteur du média → voit ses propres fichiers
-    - autres → ne voient rien (même dans la même zone)
+    - les autres → ne voient pas l'URL, même dans la même zone
     """
     import os
+    from fastapi.responses import RedirectResponse
+    from sqlalchemy import text
 
     k = (kind or "").strip().lower()
     if k not in ALLOWED_KINDS:
         raise HTTPException(status_code=400, detail="invalid kind")
 
-    # 1️⃣ Vérifier si admin
+    # 1) admin ?
     is_admin = False
     try:
         admin_hdr = (request.headers.get("x-admin-token") or "").strip()
@@ -1819,9 +1822,10 @@ async def attachments_near(
         pass
 
     try:
-        # 2️⃣ Récupération des attachments proches
+        # 2) on récupère les attachments proches
         rs = await db.execute(
-            text("""
+            text(
+                """
                 WITH me AS (
                     SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
                 )
@@ -1838,7 +1842,8 @@ async def attachments_near(
                   AND ST_DWithin(geom::geography, (SELECT g FROM me), :r)
                 ORDER BY created_at DESC, id DESC
                 LIMIT 200
-            """),
+                """
+            ),
             {
                 "k": k,
                 "lng": lng,
@@ -1849,20 +1854,20 @@ async def attachments_near(
         )
         rows = rs.mappings().all()
 
-        # 3️⃣ Identifier quels médias appartiennent à l'utilisateur connecté
-        owner_ok_ids = set()
+        # 3) quels médias appartiennent au viewer ?
+        owner_ok_ids: set[str] = set()
         if not is_admin and viewer_user_id:
             for r in rows:
                 if r["user_id"] and str(r["user_id"]) == str(viewer_user_id):
                     owner_ok_ids.add(str(r["id"]))
 
-        # 4️⃣ Préparer la réponse
+        # 4) construire la réponse
         out = []
         for r in rows:
             raw_url = r["url"]
             signed = None
 
-            # on ne signe que si l'utilisateur est autorisé
+            # on signe seulement si autorisé
             if raw_url and (is_admin or str(r["id"]) in owner_ok_ids):
                 try:
                     signed = await get_signed_cached(
@@ -1872,9 +1877,10 @@ async def attachments_near(
                     if debug:
                         signed = None
 
-            # deviner le type MIME
-            guessed_mime = None
             final_url = signed or raw_url
+
+            # deviner le mime
+            guessed_mime = None
             if final_url:
                 low = final_url.lower()
                 if low.endswith(".jpg") or low.endswith(".jpeg"):
@@ -1888,34 +1894,54 @@ async def attachments_near(
                 elif low.endswith(".webm"):
                     guessed_mime = "video/webm"
 
-            # réponse selon droits
             if is_admin or (str(r["id"]) in owner_ok_ids):
-                out.append({
-                    "id": str(r["id"]),
-                    "kind": k,
-                    "lat": float(r["lat"]),
-                    "lng": float(r["lng"]),
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                    "url": final_url,
-                    "mime_type": guessed_mime,
-                    "uploader_id": str(r["user_id"]) if r["user_id"] else None,
-                })
+                # on donne l'URL
+                out.append(
+                    {
+                        "id": str(r["id"]),
+                        "kind": k,
+                        "lat": float(r["lat"]),
+                        "lng": float(r["lng"]),
+                        "created_at": r["created_at"].isoformat()
+                        if r["created_at"]
+                        else None,
+                        "url": final_url,
+                        "mime_type": guessed_mime,
+                        "uploader_id": str(r["user_id"]) if r["user_id"] else None,
+                    }
+                )
             else:
-                out.append({
-                    "id": str(r["id"]),
-                    "kind": k,
-                    "lat": float(r["lat"]),
-                    "lng": float(r["lng"]),
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                    "url": None,
-                    "note": "🔒 Média réservé à son auteur ou aux secours",
-                })
+                # pas autorisé → on masque
+                out.append(
+                    {
+                        "id": str(r["id"]),
+                        "kind": k,
+                        "lat": float(r["lat"]),
+                        "lng": float(r["lng"]),
+                        "created_at": r["created_at"].isoformat()
+                        if r["created_at"]
+                        else None,
+                        "url": None,
+                        "note": "🔒 Média réservé à son auteur ou aux secours",
+                    }
+                )
+
+        # 5) mode ?raw=1 → on redirige directement vers le premier média autorisé
+        raw = request.query_params.get("raw")
+        if raw == "1":
+            for item in out:
+                if item.get("url"):
+                    return RedirectResponse(item["url"])
+            # pas d'URL dispo → on renvoie quand même la liste
+            return out
 
         return out
 
     except Exception as e:
         if debug:
-            raise HTTPException(status_code=500, detail=f"attachments_near error: {e}")
+            raise HTTPException(
+                status_code=500, detail=f"attachments_near error: {e}"
+            )
         raise HTTPException(status_code=500, detail="attachments_near error")
 
 
