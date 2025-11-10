@@ -1791,31 +1791,36 @@ async def attachments_near(
     radius_m: int = Query(150, ge=10, le=2000),
     hours: int = Query(48, ge=1, le=168),
     viewer_user_id: Optional[UUID] = Query(
-        None, description="ID de l'utilisateur qui regarde (pour savoir si c'est l'auteur)"
+        None,
+        description="Permet à l'auteur de voir sa propre image",
     ),
     debug: int = Query(0),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Renvoie les médias proches.
-    - admin → voit tout
-    - auteur (même user_id, même kind, même zone) → voit
-    - les autres → pas d’URL
+    Version 'qui marchait' :
+    - admin voit tout
+    - auteur d'un report proche (même kind) voit
+    - les autres ne voient pas l'URL
+    - ?raw=1 → redirection directe vers le 1er média autorisé
     """
+    import os
+    from fastapi.responses import RedirectResponse
+    from sqlalchemy import text
+
     k = (kind or "").strip().lower()
     if k not in ALLOWED_KINDS:
         raise HTTPException(status_code=400, detail="invalid kind")
 
-    # 1) est-ce un admin ?
-    import os
+    # 1) admin ?
     is_admin = False
     try:
-      admin_hdr = (request.headers.get("x-admin-token") or "").strip()
-      admin_tok = (os.getenv("ADMIN_TOKEN") or "").strip()
-      is_admin = bool(admin_tok) and admin_hdr == admin_tok
+        admin_hdr = (request.headers.get("x-admin-token") or "").strip()
+        tok = (os.getenv("ADMIN_TOKEN") or "").strip()
+        is_admin = bool(tok) and admin_hdr == tok
     except Exception:
-      pass
+        pass
 
     try:
         # 2) on récupère les attachments proches
@@ -1838,13 +1843,7 @@ async def attachments_near(
                 ORDER BY created_at DESC, id DESC
                 LIMIT 200
             """),
-            {
-                "k": k,
-                "lng": lng,
-                "lat": lat,
-                "r": radius_m,
-                "hours": int(hours),
-            },
+            {"k": k, "lng": lng, "lat": lat, "r": radius_m, "hours": int(hours)},
         )
         rows = rs.mappings().all()
 
@@ -1881,19 +1880,15 @@ async def attachments_near(
             raw_url = r["url"]
             signed = None
 
-            # on ne signe que si autorisé
+            # on essaie de signer seulement si on a le droit de voir
             if raw_url and (is_admin or owner_ok):
                 try:
-                    signed = await get_signed_cached(
-                        raw_url,
-                        cache_ttl=60,
-                        link_ttl_sec=300,
-                    )
+                    signed = await get_signed_cached(raw_url, cache_ttl=60, link_ttl_sec=300)
                 except Exception:
                     if debug:
                         signed = None
 
-            # devine le mime
+            # deviner le mime juste pour le front
             guessed_mime = None
             final_url = signed or raw_url
             if final_url:
@@ -1910,7 +1905,6 @@ async def attachments_near(
                     guessed_mime = "video/webm"
 
             if is_admin or owner_ok:
-                # 👉 ici on donne l'URL
                 out.append({
                     "id": str(r["id"]),
                     "kind": k,
@@ -1922,7 +1916,7 @@ async def attachments_near(
                     "uploader_id": str(r["user_id"]) if r["user_id"] else None,
                 })
             else:
-                # 👉 pas l'owner → pas d'URL
+                # pas le droit → on masque l’URL
                 out.append({
                     "id": str(r["id"]),
                     "kind": k,
@@ -1930,8 +1924,15 @@ async def attachments_near(
                     "lng": float(r["lng"]),
                     "created_at": r["created_at"].isoformat() if r["created_at"] else None,
                     "url": None,
-                    "note": "🔒 Média réservé à l'auteur ou aux secours",
+                    "note": "📷 Média réservé à l'auteur ou à l'admin",
                 })
+
+        # 4) si ?raw=1 → on redirige vers le 1er média accessible
+        if request.query_params.get("raw") == "1":
+            for item in out:
+                if item.get("url"):
+                    return RedirectResponse(item["url"])
+            return out
 
         return out
 
