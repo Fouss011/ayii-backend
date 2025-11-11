@@ -200,11 +200,15 @@ async def upload_video(
         pass
 
     # lire le fichier
+    # lire le fichier
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty file")
-    if len(data) > 40 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="video too large")
+
+    # ✅ limite à 10 MB
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="video too large (max ~10MB)")
+
 
     # idem key
     idem = (idempotency_key or "").strip() or None
@@ -339,6 +343,42 @@ async def upload_video(
         "url": url_public,
         "idempotency_key": idem,
     }
+
+@router.post("/maintenance/purge_old_attachments")
+async def purge_old_attachments(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Supprime de la base les attachments plus vieux que 49 jours.
+    (à appeler via cron ou à la main)
+    """
+    import os
+    from sqlalchemy import text
+
+    admin_tok = (os.getenv("ADMIN_TOKEN") or "").strip()
+    req_tok = (request.headers.get("x-admin-token") or "").strip()
+    if not admin_tok or req_tok != admin_tok:
+      raise HTTPException(status_code=403, detail="forbidden")
+
+    # on récupère les vieux (pour info)
+    rs = await db.execute(
+        text("""
+            SELECT id, url
+            FROM attachments
+            WHERE created_at < NOW() - INTERVAL '49 days'
+        """)
+    )
+    rows = rs.mappings().all()
+
+    # on supprime en base
+    await db.execute(
+        text("DELETE FROM attachments WHERE created_at < NOW() - INTERVAL '49 days'")
+    )
+    await db.commit()
+
+    return {"ok": True, "deleted": len(rows)}
+
 
 
 # --------- Upload vers Supabase Storage ----------
@@ -811,13 +851,23 @@ async def map_endpoint(
 
 
 # --------- POST /report ----------
+from typing import Optional
+from uuid import UUID
+from pydantic import BaseModel
+from fastapi import Body, Depends, HTTPException, Header, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+
+# ... tes imports existants (get_db, ALLOWED_KINDS, ADMIN_TOKEN, OWNERSHIP_RADIUS_M, _to_uuid_or_none, etc.)
+
 class ReportIn(BaseModel):
-    kind: str            # "power" | "water" | "traffic" | "accident" | "fire" | "flood"
+    kind: str            # "power" | "water" | "traffic" | ...
     signal: str          # "cut" | "restored"
     lat: float
     lng: float
     user_id: Optional[str] = None
     idempotency_key: Optional[str] = None
+    phone: Optional[str] = None   # 👈 nouveau champ
 
 
 @router.post("/report")
@@ -826,7 +876,7 @@ async def post_report(
     db: AsyncSession = Depends(get_db),
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    # Timeout SQL "local" pour éviter que la requête reste bloquée côté DB
+    # petit timeout
     try:
         await db.execute(text("SET LOCAL statement_timeout = '8s'"))
     except Exception:
@@ -837,14 +887,14 @@ async def post_report(
     if kind not in ALLOWED_KINDS:
         raise HTTPException(400, "invalid kind")
 
-    if signal not in {"cut","restored"}:
+    if signal not in {"cut", "restored"}:
         raise HTTPException(400, "invalid signal")
 
     uid = _to_uuid_or_none(p.user_id)
     is_admin = (x_admin_token or "").strip() == ADMIN_TOKEN
     idem = (p.idempotency_key or "").strip() or None
 
-    # Upsert user (si user_id fourni) pour éviter FK brisée
+    # upsert user
     if uid:
         try:
             await db.execute(
@@ -855,54 +905,74 @@ async def post_report(
         except Exception:
             await db.rollback()
 
-    # 1) Enregistrer le report (idempotent)
+    # 1) insertion report (idempotent) + phone
     inserted_id = None
     try:
         res = await db.execute(text("""
-            INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
+            INSERT INTO reports(
+                kind, signal, geom, user_id, created_at, idempotency_key, phone
+            )
             SELECT
               CAST(:kind   AS report_kind),
               CAST(:signal AS report_signal),
               ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
               CAST(NULLIF(:uid,'') AS uuid),
               NOW(),
-              NULLIF(:idem,'')::text
+              NULLIF(:idem,'')::text,
+              :phone
             WHERE
               (:idem IS NULL OR :idem = '')
               OR NOT EXISTS (SELECT 1 FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text)
             RETURNING id
-        """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": (uid or ""), "idem": idem})
+        """), {
+            "kind": kind,
+            "signal": signal,
+            "lng": p.lng,
+            "lat": p.lat,
+            "uid": (uid or ""),
+            "idem": idem,
+            "phone": p.phone,
+        })
         row = res.fetchone()
         await db.commit()
         inserted_id = row[0] if row else None
     except Exception:
+        # fallback si tes types Postgres sont en text
         await db.rollback()
         try:
             res = await db.execute(text("""
-                INSERT INTO reports(kind, signal, geom, user_id, created_at, idempotency_key)
+                INSERT INTO reports(
+                    kind, signal, geom, user_id, created_at, idempotency_key, phone
+                )
                 SELECT
                   CAST(:kind   AS text),
                   CAST(:signal AS text),
                   ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
                   CAST(NULLIF(:uid,'') AS uuid),
                   NOW(),
-                  NULLIF(:idem,'')::text
+                  NULLIF(:idem,'')::text,
+                  :phone
                 WHERE
                   (:idem IS NULL OR :idem = '')
                   OR NOT EXISTS (SELECT 1 FROM reports WHERE idempotency_key = NULLIF(:idem,'')::text)
                 RETURNING id
-            """), {"kind": kind, "signal": signal, "lng": p.lng, "lat": p.lat, "uid": (uid or ""), "idem": idem})
+            """), {
+                "kind": kind,
+                "signal": signal,
+                "lng": p.lng,
+                "lat": p.lat,
+                "uid": (uid or ""),
+                "idem": idem,
+                "phone": p.phone,
+            })
             row = res.fetchone()
             await db.commit()
             inserted_id = row[0] if row else None
         except Exception as e2:
             await db.rollback()
             raise HTTPException(500, f"report insert failed: {e2}")
-            
-        
-    
 
-    # 2) Mise à jour incidents/outages (vérité carte)
+    # 2) mise à jour incidents / outages comme tu faisais
     try:
         try:
             await db.execute(text("SET LOCAL statement_timeout = '6s'"))
@@ -910,7 +980,7 @@ async def post_report(
             await db.rollback()
 
         if signal == "cut":
-            if kind in ("power","water"):
+            if kind in ("power", "water"):
                 # OUTAGES
                 try:
                     await db.execute(text("""
@@ -952,7 +1022,7 @@ async def post_report(
                 """), {"kind": kind, "lng": p.lng, "lat": p.lat})
                 await db.commit()
         else:
-            # RESTORED — ownership si non-admin
+            # RESTORED — on garde ta logique d'ownership
             if not is_admin:
                 if uid:
                     q = await db.execute(text("""
@@ -964,13 +1034,19 @@ async def post_report(
                            AND r.created_at >= NOW() - INTERVAL '24 hours'
                            AND ST_DWithin(r.geom, (SELECT g FROM me), :ownr)
                          LIMIT 1
-                    """), {"kind": kind, "uid": uid, "lng": p.lng, "lat": p.lat, "ownr": OWNERSHIP_RADIUS_M})
+                    """), {
+                        "kind": kind,
+                        "uid": uid,
+                        "lng": p.lng,
+                        "lat": p.lat,
+                        "ownr": OWNERSHIP_RADIUS_M,
+                    })
                     if q.first() is None:
                         raise HTTPException(403, "not_owner")
                 else:
                     raise HTTPException(403, "not_owner")
 
-            if kind in ("power","water"):
+            if kind in ("power", "water"):
                 try:
                     await db.execute(text("""
                         WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
@@ -1008,6 +1084,7 @@ async def post_report(
         raise HTTPException(500, f"events update failed: {e}")
 
     return {"ok": True, "id": inserted_id, "idempotency_key": idem}
+
 
 # --------- Admin: factory reset ----------
 @router.post("/admin/factory_reset")
