@@ -1086,6 +1086,30 @@ async def post_report(
     return {"ok": True, "id": inserted_id, "idempotency_key": idem}
 
 
+@router.get("/reports_recent")
+async def reports_recent(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    import os
+    from sqlalchemy import text
+
+    admin_tok = (os.getenv("ADMIN_TOKEN") or "").strip()
+    req_tok = (request.headers.get("x-admin-token") or "").strip()
+    if not admin_tok or req_tok != admin_tok:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    rs = await db.execute(text("""
+        SELECT id, kind, signal, ST_Y(geom::geometry) AS lat, ST_X(geom::geometry) AS lng,
+               user_id, created_at, phone
+        FROM reports
+        ORDER BY created_at DESC
+        LIMIT 100
+    """))
+    rows = rs.mappings().all()
+    return [dict(r) for r in rows]
+
+
 # --------- Admin: factory reset ----------
 @router.post("/admin/factory_reset")
 async def admin_factory_reset(request: Request, db: AsyncSession = Depends(get_db)):
