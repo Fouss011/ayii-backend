@@ -200,7 +200,6 @@ async def upload_video(
         pass
 
     # lire le fichier
-    # lire le fichier
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty file")
