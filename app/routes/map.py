@@ -206,8 +206,9 @@ async def upload_video(
         raise HTTPException(status_code=400, detail="empty file")
 
     # ✅ limite à 10 MB
-    if len(data) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="video too large (max ~10MB)")
+    if len(data) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="video too large (max ~15MB)")
+
 
 
     # idem key
