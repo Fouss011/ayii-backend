@@ -159,69 +159,81 @@ async def dashboard_page():
 
 
     function render(){
-      const list=$('#list'); list.innerHTML='';
-      let data=state.items.slice();
+  const list = $('#list'); 
+  list.innerHTML = '';
+  let data = state.items.slice();
 
-      if(state.filters.kind) data=data.filter(x => (x.kind||'').toLowerCase()===state.filters.kind);
-      const q=(state.filters.q||'').trim().toLowerCase();
-      if(q) data=data.filter(x => (x.id||'').toLowerCase().includes(q) || (x.note||'').toLowerCase().includes(q));
+  if (state.filters.kind)
+    data = data.filter(x => (x.kind||'').toLowerCase() === state.filters.kind);
 
-      // tri par gravité
-      // tri par date : plus récent → plus vieux
-      const ts = d => Date.parse(d?.created_at || 0) || 0;
-      data.sort((a,b)=> ts(b) - ts(a));
+  const q = (state.filters.q || '').trim().toLowerCase();
+  if (q)
+    data = data.filter(x =>
+      (x.id||'').toLowerCase().includes(q) ||
+      (x.note||'').toLowerCase().includes(q)
+    );
 
+  // tri plus récent d'abord
+  const ts = d => Date.parse(d?.created_at || 0) || 0;
+  data.sort((a,b)=> ts(b) - ts(a));
 
-      $('#summary').textContent = data.length+' élément(s)';
-      const tpl=$('#tpl-row');
+  $('#summary').textContent = data.length + ' élément(s)';
+  const tpl = $('#tpl-row');
 
-      data.forEach(x=>{
-        const frag=tpl.content.cloneNode(true);
+  data.forEach(x => {
+    const frag = tpl.content.cloneNode(true);
 
-        // vignette
-        $('.thumbhost', frag).innerHTML = buildThumbHTML(x);
+    // vignette
+    $('.thumbhost', frag).innerHTML = buildThumbHTML(x);
 
-        // libellé + statut + gravité
-        $('[data-kind]', frag).textContent = iconKind(x.kind)+' '+labelKind(x.kind);
-        const st=(x.status||'new');
-        const chip=$('.chip', frag);
-        chip.textContent=st; chip.classList.add('chip-'+st);
-        chip.insertAdjacentHTML('afterend',' '+severityChip(severityScore(x)));
+    // libellé + statut + gravité
+    $('[data-kind]', frag).textContent = iconKind(x.kind) + ' ' + labelKind(x.kind);
+    const st = (x.status || 'new');
+    const chip = $('.chip', frag);
+    chip.textContent = st;
+    chip.classList.add('chip-' + st);
+    chip.insertAdjacentHTML('afterend', ' ' + severityChip(severityScore(x)));
 
-        // infos
-        $('[data-id]',  frag).textContent=(x.id||'').slice(0,8);
-        $('[data-geo]', frag).textContent=(+x.lat).toFixed(5)+', '+(+x.lng).toFixed(5);
-        $('[data-when]',frag).textContent=(x.created_at||'').replace('T',' ').replace('Z','');
-        $('[data-age]', frag).textContent=(x.age_min!=null)?('il y a '+x.age_min+' min'):'';
-        // téléphone (si l’API l’a renvoyé)
-if (x.phone) {
-  const p = document.createElement('div');
-  p.className = "text-xs";
-  p.style.color = "var(--muted)";
-  p.textContent = "📞 " + x.phone;
-  frag.querySelector('.space-y-1').appendChild(p);
+    // infos
+    $('[data-id]',  frag).textContent  = (x.id || '').slice(0,8);
+    $('[data-geo]', frag).textContent  = (+x.lat).toFixed(5) + ', ' + (+x.lng).toFixed(5);
+    $('[data-when]',frag).textContent  = (x.created_at || '').replace('T',' ').replace('Z','');
+    $('[data-age]', frag).textContent  = (x.age_min != null) ? ('il y a ' + x.age_min + ' min') : '';
+
+    // ✅ téléphone (on utilise l’élément du template)
+    const phoneEl = $('[data-phone]', frag);
+    if (x.phone) {
+      phoneEl.textContent = '📞 ' + x.phone;
+      phoneEl.style.display = 'block';
+    }
+
+    // actions
+    $$('[data-act]', frag).forEach(btn => {
+      btn.onclick = async () => {
+        if (!state.token) { alert('Token requis'); return; }
+        const act  = btn.getAttribute('data-act');
+        const next = (act === 'confirm') ? 'confirmed' : 'resolved';
+        const old  = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '…';
+        try {
+          const res = await api.mark(state.token, x.id, next);
+          if (!res.ok) throw new Error(res.detail || 'Erreur');
+          x.status = next;
+          render();
+        } catch(e) {
+          alert('Action impossible: ' + (e?.message || e));
+        } finally {
+          btn.disabled = false;
+          btn.textContent = old;
+        }
+      };
+    });
+
+    list.appendChild(frag);
+  });
 }
 
-
-        // actions
-        $$('[data-act]', frag).forEach(btn=>{
-          btn.onclick=async ()=>{
-            if(!state.token){ alert('Token requis'); return; }
-            const act=btn.getAttribute('data-act');
-            const next=(act==='confirm')?'confirmed':'resolved';
-            const old=btn.textContent; btn.disabled=true; btn.textContent='…';
-            try{
-              const res=await api.mark(state.token, x.id, next);
-              if(!res.ok) throw new Error(res.detail || 'Erreur');
-              x.status=next; render();
-            }catch(e){ alert('Action impossible: '+(e?.message||e)); }
-            finally{ btn.disabled=false; btn.textContent=old; }
-          };
-        });
-
-        list.appendChild(frag);
-      });
-    }
 
     async function load(){
       if(!state.token){ $('#auth-status').textContent='Token manquant'; state.items=[]; render(); return; }
@@ -319,24 +331,22 @@ if (x.phone) {
     <div class="row p-4">
       <div class="thumbhost"></div>
       <div class="space-y-1">
-        <div class="flex items-center gap-2">
-          <span data-kind class="text-[11px] font-semibold px-2 py-0.5 rounded-md" style="background:#e2e8f0; color:#334155;"></span>
-          <span class="chip"></span>
-          <span class="text-xs" data-age style="color:var(--muted)"></span>
-        </div>
-        <div class="text-sm">
-          <span data-id class="font-mono" style="color:#475569"></span>
-          <span style="color:#94a3b8">•</span>
-          <span data-geo style="color:#475569"></span>
-          <span style="color:#94a3b8">•</span>
-          <span data-when style="color:#475569"></span>
-        </div>
-      </div>
-      <div class="flex items-center gap-2">
-        <button data-act="confirm" class="btn btn-ghost">Confirmer</button>
-        <button data-act="resolve" class="btn btn-ghost">Traiter</button>
-      </div>
-    </div>
+  <div class="flex items-center gap-2">
+    <span data-kind class="text-[11px] font-semibold px-2 py-0.5 rounded-md" style="background:#e2e8f0; color:#334155;"></span>
+    <span class="chip"></span>
+    <span class="text-xs" data-age style="color:var(--muted)"></span>
+  </div>
+  <div class="text-sm">
+    <span data-id class="font-mono" style="color:#475569"></span>
+    <span style="color:#94a3b8">•</span>
+    <span data-geo style="color:#475569"></span>
+    <span style="color:#94a3b8">•</span>
+    <span data-when style="color:#475569"></span>
+  </div>
+  <!-- 👇 nouvelle ligne téléphone -->
+  <div class="text-xs text-blue-700 dark:text-blue-300" data-phone style="display:none"></div>
+</div>
+
   </template>
 </body>
 </html>
