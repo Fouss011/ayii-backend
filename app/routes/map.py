@@ -791,6 +791,7 @@ async def map_endpoint(
         alert_zones = await fetch_alert_zones(db, lat, lng, r_m)
 
         # derniers reports pour les badges / info
+                # derniers reports pour les badges / info
         q_rep = text(f"""
             WITH me AS (
               SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
@@ -801,8 +802,8 @@ async def map_endpoint(
                    ST_Y((geom::geometry)) AS lat,
                    ST_X((geom::geometry)) AS lng,
                    user_id,
-                   created_at
-                   phone
+                   created_at,
+                   phone                    -- 👈 on l’ajoute ici
               FROM reports
              WHERE ST_DWithin((geom::geography), (SELECT g FROM me), :r)
                AND LOWER(TRIM(signal::text)) = 'cut'
@@ -820,10 +821,11 @@ async def map_endpoint(
                 "lng": float(r.lng),
                 "user_id": r.user_id,
                 "created_at": r.created_at,
-                "phone": getattr(r, "phone", None),
+                "phone": getattr(r, "phone", None),   # 👈 on le remet dans le JSON
             }
             for r in res_rep.fetchall()
         ]
+
 
         payload = {
             "outages": outages,
