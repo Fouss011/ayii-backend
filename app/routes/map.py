@@ -177,127 +177,148 @@ async def upload_video(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Upload vidéo → Supabase obligatoire.
-    Admin peut tout envoyer.
-    Les autres doivent avoir déclaré un report proche.
+    Upload d'une vidéo pour un incident.
+    - vérifie que l'utilisateur est bien l'auteur (sauf admin)
+    - stocke sur Supabase (ou fallback disque)
+    - insère dans attachments
     """
-    import os, uuid, time
+    import os, uuid, time as _time
     from sqlalchemy import text
-    import httpx
+    from app.config import BASE_PUBLIC_URL, STATIC_DIR, STATIC_URL_PATH
 
-    # 0) admin ?
+    K = (kind or "").strip().lower()
+    if K not in {"traffic","accident","fire","flood","power","water","assault","weapon","medical"}:
+        raise HTTPException(status_code=400, detail="invalid kind")
+
+    # admin ?
     is_admin = False
     try:
         admin_hdr = (request.headers.get("x-admin-token") or "").strip()
-        tok = (os.getenv("ADMIN_TOKEN") or "").strip()
-        is_admin = bool(tok) and admin_hdr == tok
+        admin_tok = (os.getenv("ADMIN_TOKEN") or os.getenv("NEXT_PUBLIC_ADMIN_TOKEN") or "").strip()
+        is_admin = bool(admin_tok) and admin_hdr == admin_tok
     except Exception:
         pass
 
-    # 1) valider kind
-    K = (kind or "").strip().lower()
-    ALLOWED = {"traffic","accident","fire","flood","power","water","assault","weapon","medical"}
-    if K not in ALLOWED:
-        raise HTTPException(status_code=400, detail="invalid kind")
-
-    # 2) lire le fichier
+    # lire le fichier
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty file")
     if len(data) > 40 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="video too large")
 
-    # 3) idempotency
+    # idem key
     idem = (idempotency_key or "").strip() or None
     if idem:
         rs = await db.execute(text("SELECT id, url FROM attachments WHERE idempotency_key = :k LIMIT 1"), {"k": idem})
         row = rs.first()
         if row:
-            return {"ok": True, "id": str(row.id), "url": row.url, "idempotency_key": idem}
+            return {
+                "ok": True,
+                "id": str(row.id),
+                "url": row.url,
+                "idempotency_key": idem,
+            }
 
-    # 4) contrôle "j'ai bien déclaré ici" (sauf admin)
+    # si pas admin → vérifier qu'il a bien déclaré à cet endroit récemment
     if not is_admin:
         if not user_id:
             raise HTTPException(status_code=403, detail="not_owner")
         chk = await db.execute(
             text("""
-                WITH me AS (SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g)
+                WITH me AS (
+                    SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
+                )
                 SELECT 1
                   FROM reports
                  WHERE user_id = :uid
-                   AND LOWER(TRIM(kind::text))   = :k
+                   AND LOWER(TRIM(kind::text)) = :k
                    AND LOWER(TRIM(signal::text)) = 'cut'
-                   AND created_at > NOW() - INTERVAL '48 hours'
+                   AND created_at > NOW() - INTERVAL '48 hour'
                    AND ST_DWithin(geom::geography, (SELECT g FROM me), 150)
                  LIMIT 1
             """),
-            {"uid": str(user_id), "k": K, "lat": float(lat), "lng": float(lng)},
+            {
+                "uid": str(user_id),
+                "k": K,
+                "lat": float(lat),
+                "lng": float(lng),
+            },
         )
         if chk.first() is None:
             raise HTTPException(status_code=403, detail="not_owner")
 
-    # 5) récup config supabase
-    supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
-    supa_key = (
-        os.getenv("SUPABASE_SERVICE_ROLE")
-        or os.getenv("SUPABASE_SERVICE_KEY")
-        or os.getenv("SUPABASE_ANON_KEY")
-    )
-    bucket = os.getenv("SUPABASE_BUCKET", "attachments")
-
-    if not supa_url or not supa_key:
-        # on ne fait PLUS de fallback disque
-        raise HTTPException(status_code=500, detail="supabase_not_configured")
-
-    # 6) construire le chemin dans le bucket
+    # déterminer l'extension à partir du content-type
     ctype = (file.content_type or "").lower().strip()
     if ctype.startswith("video/webm"):
         ext = ".webm"
-    elif ctype.startswith("video/3gpp"):
+    elif ctype.startswith("video/3gpp") or ctype.startswith("video/3gp"):
         ext = ".3gp"
     else:
-        ext = ".mp4"
+        ext = ".mp4"  # défaut
 
-    original_name = file.filename or f"{K}_{uuid.uuid4().hex}{ext}"
-    if "." not in original_name:
-        original_name = original_name + ext
+    filename_orig = file.filename or f"{K}_{uuid.uuid4().hex}{ext}"
+    if "." not in filename_orig:
+        filename_orig = filename_orig + ext
 
-    path = f"{K}/{int(time.time())}-{uuid.uuid4().hex}-{os.path.basename(original_name)}"
-    upload_url = f"{supa_url}/storage/v1/object/{bucket}/{path}"
+    # chemin dans le bucket → IMPORTANT : on utilise K ici
+    path = f"{K}/{int(_time.time())}-{uuid.uuid4().hex}-{os.path.basename(filename_orig)}"
 
-    # 7) upload vers supabase
-    headers = {
-        "Authorization": f"Bearer {supa_key}",
-        "Content-Type": ctype or "video/mp4",
-        "x-upsert": "false",
-    }
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(upload_url, headers=headers, content=data)
-    if r.status_code not in (200, 201):
-        raise HTTPException(status_code=500, detail=f"supabase_upload_failed [{r.status_code}]: {r.text}")
+    # upload
+    url_public: Optional[str] = None
+    try:
+        bucket   = os.getenv("SUPABASE_BUCKET", "attachments")
+        supa_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+        supa_key = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE_KEY")
 
-    # 8) URL publique
-    url_public = f"{supa_url}/storage/v1/object/public/{bucket}/{path}"
+        if supa_url and supa_key:
+            import httpx
+            upload_url = f"{supa_url}/storage/v1/object/{bucket}/{path}"
+            headers = {
+                "Authorization": f"Bearer {supa_key}",
+                "Content-Type": ctype or "video/mp4",
+                "x-upsert": "false",
+            }
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(upload_url, headers=headers, content=data)
+            if r.status_code not in (200, 201):
+                raise RuntimeError(f"supabase upload failed [{r.status_code}]: {r.text}")
+            url_public = f"{supa_url}/storage/v1/object/public/{bucket}/{path}"
+        else:
+            raise RuntimeError("supabase credentials missing")
+    except Exception:
+        # fallback disque
+        os.makedirs(STATIC_DIR, exist_ok=True)
+        disk_name = os.path.basename(path)
+        disk_path = os.path.join(STATIC_DIR, disk_name)
+        with open(disk_path, "wb") as fp:
+            fp.write(data)
+        base = (BASE_PUBLIC_URL or "").rstrip("/")
+        if base:
+            url_public = f"{base}{STATIC_URL_PATH}/{disk_name}"
+        else:
+            url_public = f"{STATIC_URL_PATH}/{disk_name}"
 
-    # 9) enregistrement en base
+    if not url_public:
+        raise HTTPException(status_code=500, detail="no_public_url")
+
+    # insérer dans attachments
     ins = text("""
-      INSERT INTO attachments (
-        kind, geom, user_id, url, idempotency_key, created_at,
-        is_sensitive, uploader_id
-      )
-      VALUES (
-        :k,
-        ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
-        :uid,
-        :url,
-        :idem,
-        NOW(),
-        TRUE,
-        :uploader
-      )
-      RETURNING id
+        INSERT INTO attachments (
+            kind, geom, user_id, url, idempotency_key, created_at, is_sensitive, uploader_id
+        )
+        VALUES (
+            :k,
+            ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography,
+            :uid,
+            :url,
+            :idem,
+            NOW(),
+            TRUE,
+            :uploader
+        )
+        RETURNING id
     """)
-    rs2 = await db.execute(
+    rs = await db.execute(
         ins,
         {
             "k": K,
@@ -309,17 +330,15 @@ async def upload_video(
             "uploader": str(user_id) if user_id else None,
         },
     )
-    row2 = rs2.first()
+    row = rs.first()
     await db.commit()
 
     return {
         "ok": True,
-        "id": str(row2.id),
+        "id": str(row.id),
         "url": url_public,
         "idempotency_key": idem,
     }
-
-
 
 
 # --------- Upload vers Supabase Storage ----------
@@ -1751,38 +1770,37 @@ async def attachments_near(
     hours: int = Query(48, ge=1, le=168),
     viewer_user_id: Optional[UUID] = Query(
         None,
-        description="Permet à l'auteur de voir sa propre image",
+        description="ID du user qui regarde (pour savoir si c'est lui qui a upload)"
     ),
     debug: int = Query(0),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Version 'qui marchait' :
-    - admin voit tout
-    - auteur d'un report proche (même kind) voit
-    - les autres ne voient pas l'URL
-    - ?raw=1 → redirection directe vers le 1er média autorisé
+    Version stricte :
+    - admin → voit tout
+    - celui qui a upload → voit ses médias
+    - un autre qui déclare à côté → ne voit pas
+    - ?raw=1 → redirection vers le 1er média autorisé
     """
     import os
-    from fastapi.responses import RedirectResponse
     from sqlalchemy import text
+    from fastapi.responses import RedirectResponse
 
     k = (kind or "").strip().lower()
     if k not in ALLOWED_KINDS:
         raise HTTPException(status_code=400, detail="invalid kind")
 
-    # 1) admin ?
+    # admin ?
     is_admin = False
     try:
         admin_hdr = (request.headers.get("x-admin-token") or "").strip()
-        tok = (os.getenv("ADMIN_TOKEN") or "").strip()
-        is_admin = bool(tok) and admin_hdr == tok
+        admin_tok = (os.getenv("ADMIN_TOKEN") or "").strip()
+        is_admin = bool(admin_tok) and admin_hdr == admin_tok
     except Exception:
         pass
 
     try:
-        # 2) on récupère les attachments proches
         rs = await db.execute(
             text("""
                 WITH me AS (
@@ -1802,54 +1820,39 @@ async def attachments_near(
                 ORDER BY created_at DESC, id DESC
                 LIMIT 200
             """),
-            {"k": k, "lng": lng, "lat": lat, "r": radius_m, "hours": int(hours)},
+            {
+                "k": k,
+                "lng": lng,
+                "lat": lat,
+                "r": radius_m,
+                "hours": int(hours),
+            },
         )
         rows = rs.mappings().all()
 
-        # 3) est-ce que le viewer est bien l'auteur d'un report proche ?
-        owner_ok = False
-        if (not is_admin) and viewer_user_id:
-            chk = await db.execute(
-                text("""
-                    WITH me AS (
-                        SELECT ST_SetSRID(ST_MakePoint(:lng,:lat),4326)::geography AS g
-                    )
-                    SELECT 1
-                      FROM reports
-                     WHERE user_id = :uid
-                       AND LOWER(TRIM(kind::text))   = :k
-                       AND LOWER(TRIM(signal::text)) = 'cut'
-                       AND created_at > NOW() - (:hours * INTERVAL '1 hour')
-                       AND ST_DWithin(geom::geography, (SELECT g FROM me), :r)
-                     LIMIT 1
-                """),
-                {
-                    "uid": str(viewer_user_id),
-                    "k": k,
-                    "lng": lng,
-                    "lat": lat,
-                    "r": radius_m,
-                    "hours": int(hours),
-                },
-            )
-            owner_ok = (chk.first() is not None)
-
         out = []
         for r in rows:
+            uploader_id = str(r["user_id"]) if r["user_id"] else None
             raw_url = r["url"]
-            signed = None
 
-            # on essaie de signer seulement si on a le droit de voir
-            if raw_url and (is_admin or owner_ok):
+            # est-ce que ce viewer est bien l'uploader ?
+            is_owner = False
+            if viewer_user_id and uploader_id:
+                if str(viewer_user_id) == uploader_id:
+                    is_owner = True
+
+            final_url = None
+            guessed_mime = None
+
+            if raw_url and (is_admin or is_owner):
                 try:
-                    signed = await get_signed_cached(raw_url, cache_ttl=60, link_ttl_sec=300)
+                    final_url = await get_signed_cached(raw_url, cache_ttl=60, link_ttl_sec=300)
                 except Exception:
                     if debug:
-                        signed = None
+                        final_url = raw_url  # en debug on laisse brut
+            else:
+                final_url = None
 
-            # deviner le mime juste pour le front
-            guessed_mime = None
-            final_url = signed or raw_url
             if final_url:
                 low = final_url.lower()
                 if low.endswith(".jpg") or low.endswith(".jpeg"):
@@ -1863,7 +1866,7 @@ async def attachments_near(
                 elif low.endswith(".webm"):
                     guessed_mime = "video/webm"
 
-            if is_admin or owner_ok:
+            if final_url:
                 out.append({
                     "id": str(r["id"]),
                     "kind": k,
@@ -1872,10 +1875,9 @@ async def attachments_near(
                     "created_at": r["created_at"].isoformat() if r["created_at"] else None,
                     "url": final_url,
                     "mime_type": guessed_mime,
-                    "uploader_id": str(r["user_id"]) if r["user_id"] else None,
+                    "uploader_id": uploader_id,
                 })
             else:
-                # pas le droit → on masque l’URL
                 out.append({
                     "id": str(r["id"]),
                     "kind": k,
@@ -1883,10 +1885,10 @@ async def attachments_near(
                     "lng": float(r["lng"]),
                     "created_at": r["created_at"].isoformat() if r["created_at"] else None,
                     "url": None,
-                    "note": "📷 Média réservé à l'auteur ou à l'admin",
+                    "note": "🔒 Média réservé à l'auteur ou à l'admin",
                 })
 
-        # 4) si ?raw=1 → on redirige vers le 1er média accessible
+        # ?raw=1 → on renvoie direct vers le 1er média autorisé
         if request.query_params.get("raw") == "1":
             for item in out:
                 if item.get("url"):
@@ -1899,6 +1901,7 @@ async def attachments_near(
         if debug:
             raise HTTPException(status_code=500, detail=f"attachments_near error: {e}")
         raise HTTPException(status_code=500, detail="attachments_near error")
+
 
 
 
