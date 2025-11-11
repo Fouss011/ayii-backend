@@ -802,6 +802,7 @@ async def map_endpoint(
                    ST_X((geom::geometry)) AS lng,
                    user_id,
                    created_at
+                   phone
               FROM reports
              WHERE ST_DWithin((geom::geography), (SELECT g FROM me), :r)
                AND LOWER(TRIM(signal::text)) = 'cut'
@@ -819,6 +820,7 @@ async def map_endpoint(
                 "lng": float(r.lng),
                 "user_id": r.user_id,
                 "created_at": r.created_at,
+                "phone": getattr(r, "phone", None),
             }
             for r in res_rep.fetchall()
         ]
