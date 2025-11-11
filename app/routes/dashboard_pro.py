@@ -193,43 +193,52 @@ async def dashboard_pro():
   // Incidents table
   function fmtAgeMin(m){ return (m==null)? "-" : `${m} min`; }
   function renderIncidents(items){
-    const rows=(items||[]).map(it=>{
-      const sev=severityScore(it);
-      return `
-        <tr class="border-b last:border-none hover:bg-gray-50">
-          <td class="p-2 text-xs text-gray-500">${it.id}</td>
-          <td class="p-2 font-medium">${it.kind}</td>
-          <td class="p-2">${it.signal}</td>
-          <td class="p-2">${(it.lat?.toFixed?it.lat.toFixed(5):it.lat)}, ${(it.lng?.toFixed?it.lng.toFixed(5):it.lng)}</td>
-          <td class="p-2">${(it.created_at||"").replace("T"," ").replace("Z","")}</td>
-          <td class="p-2"><span class="pill">${it.status}</span></td>
-          <td class="p-2">${fmtAgeMin(it.age_min)}</td>
-          <td class="p-2">${severityPill(sev)}</td>
-          <td class="p-2">${
-  it.photo_url
-    ? (/\.(mp4|webm|mov)(\?|$)/i.test(it.photo_url)
-        ? `<a href="${it.photo_url}" target="_blank" class="text-blue-600 underline">Vidéo</a>`
-        : `<a href="${it.photo_url}" target="_blank" class="text-blue-600 underline">Photo</a>`
-      )
-    : `<span class="text-gray-400">—</span>`
-}</td>
+  const rows=(items||[]).map(it=>{
+    const sev=severityScore(it);
+    return `
+      <tr class="border-b last:border-none hover:bg-gray-50">
+        <td class="p-2 text-xs text-gray-500">${it.id}</td>
+        <td class="p-2 font-medium">${it.kind}</td>
+        <td class="p-2">${it.signal}</td>
+        <td class="p-2">${(it.lat?.toFixed?it.lat.toFixed(5):it.lat)}, ${(it.lng?.toFixed?it.lng.toFixed(5):it.lng)}</td>
+        <td class="p-2">${(it.created_at||"").replace("T"," ").replace("Z","")}</td>
+        <td class="p-2"><span class="pill">${it.status}</span></td>
+        <td class="p-2">${fmtAgeMin(it.age_min)}</td>
+        <td class="p-2">${severityPill(sev)}</td>
+        <td class="p-2">${it.phone ? `📞 ${it.phone}` : `<span class="text-gray-400">—</span>`}</td>
+        <td class="p-2">${
+          it.photo_url
+            ? (/\.(mp4|webm|mov)(\?|$)/i.test(it.photo_url)
+                ? `<a href="${it.photo_url}" target="_blank" class="text-blue-600 underline">Vidéo</a>`
+                : `<a href="${it.photo_url}" target="_blank" class="text-blue-600 underline">Photo</a>`
+              )
+            : `<span class="text-gray-400">—</span>`
+        }</td>
+      </tr>`;
+  }).join("");
 
-        </tr>`;
-    }).join("");
-    $("#incTable").innerHTML = `
-      <div class="overflow-x-auto">
-        <table class="w-full text-sm">
-          <thead>
-            <tr class="text-left text-gray-500 border-b">
-              <th class="p-2">ID</th><th class="p-2">Type</th><th class="p-2">Signal</th>
-              <th class="p-2">Coord.</th><th class="p-2">Créé</th><th class="p-2">Statut</th>
-              <th class="p-2">Âge</th><th class="p-2">Gravité</th><th class="p-2">Pièce jointe</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>`;
-  }
+  $("#incTable").innerHTML = `
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-left text-gray-500 border-b">
+            <th class="p-2">ID</th>
+            <th class="p-2">Type</th>
+            <th class="p-2">Signal</th>
+            <th class="p-2">Coord.</th>
+            <th class="p-2">Créé</th>
+            <th class="p-2">Statut</th>
+            <th class="p-2">Âge</th>
+            <th class="p-2">Gravité</th>
+            <th class="p-2">📞 Tel</th>
+            <th class="p-2">Pièce jointe</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
   async function loadIncidents(){
     try{
       const s=$("#status").value;

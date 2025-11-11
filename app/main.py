@@ -212,6 +212,10 @@ except Exception as e:
 from app.routes.dashboard import router as dashboard_router       # noqa: E402
 app.include_router(dashboard_router)
 
+from app.routes import cta
+app.include_router(cta.router)
+
+
 # Metrics API
 try:
     from app.routes.metrics import router as metrics_router     # noqa: E402

@@ -193,6 +193,15 @@ async def dashboard_page():
         $('[data-geo]', frag).textContent=(+x.lat).toFixed(5)+', '+(+x.lng).toFixed(5);
         $('[data-when]',frag).textContent=(x.created_at||'').replace('T',' ').replace('Z','');
         $('[data-age]', frag).textContent=(x.age_min!=null)?('il y a '+x.age_min+' min'):'';
+        // téléphone (si l’API l’a renvoyé)
+if (x.phone) {
+  const p = document.createElement('div');
+  p.className = "text-xs";
+  p.style.color = "var(--muted)";
+  p.textContent = "📞 " + x.phone;
+  frag.querySelector('.space-y-1').appendChild(p);
+}
+
 
         // actions
         $$('[data-act]', frag).forEach(btn=>{
