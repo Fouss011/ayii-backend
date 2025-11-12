@@ -3,7 +3,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 import os
-
 from app.db import get_db
 
 router = APIRouter(tags=["CTA"])
@@ -11,35 +10,51 @@ router = APIRouter(tags=["CTA"])
 @router.get("/cta/incidents")
 async def cta_incidents(
     request: Request,
-    status: str = Query("", description="new|confirmed|resolved (pas encore filtré)"),
+    status: str = Query("", description="new|confirmed|resolved (placeholder)"),
     limit: int = Query(20, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
-    # vérif token admin
+    # Auth admin
     admin_tok = (os.getenv("ADMIN_TOKEN") or "").strip()
     req_tok   = (request.headers.get("x-admin-token") or "").strip()
     if admin_tok and req_tok != admin_tok:
         raise HTTPException(status_code=401, detail="invalid admin token")
 
-    # IMPORTANT: on renvoie bien phone
-    res = await db.execute(text("""
+    # NB: on renvoie bien phone + une photo/vidéo récente si dispo
+    q = text("""
+        WITH latest_att AS (
+          SELECT DISTINCT ON (kind, round(CAST(ST_Y(geom::geometry) AS numeric), 5), round(CAST(ST_X(geom::geometry) AS numeric), 5))
+                 kind,
+                 round(CAST(ST_Y(geom::geometry) AS numeric), 5) AS lat_r,
+                 round(CAST(ST_X(geom::geometry) AS numeric), 5) AS lng_r,
+                 url,
+                 mime_type,
+                 created_at
+          FROM attachments
+          WHERE created_at > NOW() - INTERVAL '72 hours'
+          ORDER BY kind, lat_r, lng_r, created_at DESC
+        )
         SELECT
-          id,
-          kind::text   AS kind,
-          signal::text AS signal,
-          ST_Y(geom::geometry) AS lat,
-          ST_X(geom::geometry) AS lng,
-          created_at,
-          phone,                  -- 👈 ici
+          r.id,
+          r.kind::text   AS kind,
+          r.signal::text AS signal,
+          ST_Y(r.geom::geometry) AS lat,
+          ST_X(r.geom::geometry) AS lng,
+          r.created_at,
+          r.phone, -- 👈 IMPORTANT
           'new'::text AS status,
-          -- si tu as déjà une jointure qui calcule photo_url, garde-la.
-          NULL::text AS photo_url,
-          EXTRACT(EPOCH FROM (NOW() - created_at))::int / 60 AS age_min
-        FROM reports
-        WHERE LOWER(TRIM(signal::text)) = 'cut'
-        ORDER BY created_at DESC
+          la.url       AS photo_url,
+          EXTRACT(EPOCH FROM (NOW() - r.created_at))::int / 60 AS age_min
+        FROM reports r
+        LEFT JOIN latest_att la
+          ON la.kind = r.kind::text
+         AND round(CAST(ST_Y(r.geom::geometry) AS numeric), 5) = la.lat_r
+         AND round(CAST(ST_X(r.geom::geometry) AS numeric), 5) = la.lng_r
+        WHERE LOWER(TRIM(r.signal::text)) = 'cut'
+        ORDER BY r.created_at DESC
         LIMIT :lim
-    """), {"lim": limit})
+    """)
+    res = await db.execute(q, {"lim": limit})
 
     items = []
     for r in res.fetchall():
@@ -53,6 +68,6 @@ async def cta_incidents(
             "status": r.status,
             "photo_url": r.photo_url,
             "age_min": int(r.age_min) if r.age_min is not None else None,
-            "phone": getattr(r, "phone", None),   # 👈 et ici dans le JSON
+            "phone": getattr(r, "phone", None),  # 👈 renvoyé au JSON
         })
     return {"items": items, "count": len(items)}
