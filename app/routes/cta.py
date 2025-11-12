@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 import os
 
-from app.db import get_db  # tu l'as déjà dans les autres routes
+from app.db import get_db
 
 router = APIRouter(tags=["CTA"])
 
@@ -15,12 +15,13 @@ async def cta_incidents(
     limit: int = Query(20, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
-    # même contrôle que ton dashboard
+    # vérif token admin
     admin_tok = (os.getenv("ADMIN_TOKEN") or "").strip()
-    req_tok = (request.headers.get("x-admin-token") or "").strip()
+    req_tok   = (request.headers.get("x-admin-token") or "").strip()
     if admin_tok and req_tok != admin_tok:
         raise HTTPException(status_code=401, detail="invalid admin token")
 
+    # IMPORTANT: on renvoie bien phone
     res = await db.execute(text("""
         SELECT
           id,
@@ -29,16 +30,29 @@ async def cta_incidents(
           ST_Y(geom::geometry) AS lat,
           ST_X(geom::geometry) AS lng,
           created_at,
-          phone,                  -- 👈 on renvoie le numéro
+          phone,                  -- 👈 ici
           'new'::text AS status,
+          -- si tu as déjà une jointure qui calcule photo_url, garde-la.
           NULL::text AS photo_url,
-          1::int   AS reports_count,
-          0::int   AS attachments_count,
           EXTRACT(EPOCH FROM (NOW() - created_at))::int / 60 AS age_min
         FROM reports
         WHERE LOWER(TRIM(signal::text)) = 'cut'
         ORDER BY created_at DESC
         LIMIT :lim
     """), {"lim": limit})
-    rows = res.mappings().all()
-    return {"items": [dict(r) for r in rows]}
+
+    items = []
+    for r in res.fetchall():
+        items.append({
+            "id": r.id,
+            "kind": r.kind,
+            "signal": r.signal,
+            "lat": float(r.lat),
+            "lng": float(r.lng),
+            "created_at": r.created_at,
+            "status": r.status,
+            "photo_url": r.photo_url,
+            "age_min": int(r.age_min) if r.age_min is not None else None,
+            "phone": getattr(r, "phone", None),   # 👈 et ici dans le JSON
+        })
+    return {"items": items, "count": len(items)}
