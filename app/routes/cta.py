@@ -22,16 +22,38 @@ SELECT
   ST_X(r.geom::geometry) AS lng,
   r.created_at,
   COALESCE(r.status,'new') AS status,
-  r.phone,
+  r.phone::text AS phone,  -- ✅ alias explicite
   (
     SELECT a.public_url
     FROM attachments a
     WHERE a.kind = r.kind::text
-      AND ST_DWithin(a.geom::geography, r.geom::geography, 150)  -- rayon 150 m
+      AND ST_DWithin(a.geom::geography, r.geom::geography, 150)
       AND a.created_at BETWEEN r.created_at - INTERVAL '72 hours' AND NOW()
     ORDER BY a.created_at DESC
     LIMIT 1
   ) AS photo_url,
+  (
+    SELECT a.mime_type
+    FROM attachments a
+    WHERE a.kind = r.kind::text
+      AND ST_DWithin(a.geom::geography, r.geom::geography, 150)
+      AND a.created_at BETWEEN r.created_at - INTERVAL '72 hours' AND NOW()
+    ORDER BY a.created_at DESC
+    LIMIT 1
+  ) AS attachment_mime,
+  (
+    SELECT CASE
+             WHEN a.mime_type ILIKE 'video/%%' THEN true
+             WHEN a.public_url ~* '\\.(mp4|webm|mov)$' THEN true
+             ELSE false
+           END
+    FROM attachments a
+    WHERE a.kind = r.kind::text
+      AND ST_DWithin(a.geom::geography, r.geom::geography, 150)
+      AND a.created_at BETWEEN r.created_at - INTERVAL '72 hours' AND NOW()
+    ORDER BY a.created_at DESC
+    LIMIT 1
+  ) AS is_video,
   EXTRACT(EPOCH FROM (NOW() - r.created_at))::int / 60 AS age_min
 FROM reports r
 WHERE LOWER(TRIM(r.signal::text)) = 'cut'
@@ -39,6 +61,7 @@ WHERE LOWER(TRIM(r.signal::text)) = 'cut'
 ORDER BY r.created_at DESC
 LIMIT :lim
 """
+
 
 def _build_sql(status: str):
     if (status or "").strip().lower() in {"new","confirmed","resolved"}:
