@@ -129,12 +129,8 @@ async def dashboard_page():
 
     function buildThumbHTML(item){
   const icon = iconKind(item.kind);
-  const url  = item.photo_url || "";   // le backend CTA te donne toujours ça
-  const isVideo = url && (
-    url.toLowerCase().endsWith(".mp4") ||
-    url.toLowerCase().endsWith(".webm") ||
-    url.toLowerCase().includes("video")
-  );
+  const url  = item.photo_url || "";
+  const isVideo = url && (/\.(mp4|webm|mov)(\?|$)/i.test(url));
 
   return `
     <div class="thumbbox">
@@ -143,9 +139,8 @@ async def dashboard_page():
         url
           ? (
               isVideo
-                ? `<video class="thumb" src="${url}" controls
-                       onloadeddata="this.previousElementSibling.style.display='none'"
-                       onerror="this.style.display='flex'">
+                ? `<video class="thumb" src="${url}" muted loop playsinline
+                       onloadeddata="this.previousElementSibling.style.display='none'">
                    </video>`
                 : `<img class="thumb" src="${url}" alt="${item.kind||''}"
                        onload="this.previousElementSibling.style.display='none'"
@@ -156,6 +151,7 @@ async def dashboard_page():
     </div>
   `;
 }
+
 
 
     function render(){

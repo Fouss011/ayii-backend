@@ -205,7 +205,7 @@ async def dashboard_pro():
         <td class="p-2"><span class="pill">${it.status}</span></td>
         <td class="p-2">${fmtAgeMin(it.age_min)}</td>
         <td class="p-2">${severityPill(sev)}</td>
-        <td class="p-2">${it.phone ? `📞 ${it.phone}` : `<span class="text-gray-400">—</span>`}</td>
+        <td class="p-2">${it.phone ? it.phone : "—"}</td>
         <td class="p-2">${
           it.photo_url
             ? (/\.(mp4|webm|mov)(\?|$)/i.test(it.photo_url)
