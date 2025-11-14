@@ -101,7 +101,7 @@ async def dashboard_page():
 
     const api = {
       incidents:(token,{status,limit})=>{
-        const u=new URL('/cta/incidents', location.origin);
+        const u=new URL('/cta/incidents_v2', location.origin);
         if(status) u.searchParams.set('status',status);
         u.searchParams.set('limit', limit||100);
         return fetch(u, {headers:{'x-admin-token':token}}).then(r=>r.json());
