@@ -17,13 +17,16 @@ def _auth_admin(request: Request):
 # -----------------------------
 # V2 MINIMAL (sans photo) — pour valider `phone`
 # -----------------------------
-@router.get("/incidents_v2")
-async def cta_incidents_v2(
+@router.get("/incidents")
+async def cta_incidents(
     request: Request,
     status: str = Query("", description="new|confirmed|resolved"),
     limit: int = Query(20, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
+    # 🔁 On réutilise exactement la V2 (même JSON, donc avec `phone`)
+    return await cta_incidents_v2(request, status, limit, db)
+
     _auth_admin(request)
 
     where_status = "AND COALESCE(r.status,'new') = :status" if (status or "").strip().lower() in {"new","confirmed","resolved"} else ""
