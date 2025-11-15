@@ -242,7 +242,7 @@ async def dashboard_pro():
   async function loadIncidents(){
     try{
       const s=$("#status").value;
-      cconst j=await getJSON(api(`/cta/incidents_v2?status=${encodeURIComponent(s)}&limit=20`));
+      const j=await getJSON(api(`/cta/incidents_v2?status=${encodeURIComponent(s)}&limit=20`));
       const items = (j.items || []).slice()
       .sort((a,b)=> (Date.parse(b.created_at||0)||0) - (Date.parse(a.created_at||0)||0));
       renderIncidents(items);
