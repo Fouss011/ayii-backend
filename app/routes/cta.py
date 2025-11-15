@@ -15,7 +15,7 @@ def _auth_admin(request: Request):
         raise HTTPException(status_code=401, detail="invalid admin token")
 
 # -----------------------------
-# V2 (phone + photo/vidéo)
+# V2 (phone + URL d'une pièce jointe du même kind)
 # -----------------------------
 @router.get("/incidents_v2")
 async def cta_incidents_v2(
@@ -33,16 +33,6 @@ async def cta_incidents_v2(
     )
 
     sql = f"""
-    WITH att AS (
-      SELECT
-        kind::text AS kind,
-        ROUND(CAST(ST_Y(geom::geometry) AS numeric), 5) AS lat_r,
-        ROUND(CAST(ST_X(geom::geometry) AS numeric), 5) AS lng_r,
-        url,
-        created_at
-      FROM attachments
-      WHERE created_at > NOW() - INTERVAL '72 hours'
-    )
     SELECT
       r.id,
       r.kind::text   AS kind,
@@ -51,16 +41,14 @@ async def cta_incidents_v2(
       ST_X(r.geom::geometry) AS lng,
       r.created_at,
       COALESCE(r.status,'new') AS status,
-      r.phone,                       -- 👈 téléphone
+      r.phone,                       -- téléphone
       (
         SELECT a.url
-        FROM att a
+        FROM attachments a
         WHERE a.kind = r.kind::text
-          AND ROUND(CAST(ST_Y(r.geom::geometry) AS numeric), 5) = a.lat_r
-          AND ROUND(CAST(ST_X(r.geom::geometry) AS numeric), 5) = a.lng_r
         ORDER BY a.created_at DESC
         LIMIT 1
-      ) AS photo_url,                -- 👈 image OU vidéo (mp4/jpg/etc.)
+      ) AS photo_url,                -- image OU vidéo la plus récente pour ce kind
       EXTRACT(EPOCH FROM (NOW() - r.created_at))::int / 60 AS age_min
     FROM reports r
     WHERE LOWER(TRIM(r.signal::text)) = 'cut'
@@ -87,7 +75,7 @@ async def cta_incidents_v2(
             "lng": float(m["lng"]),
             "created_at": m["created_at"],
             "status": m["status"],
-            "photo_url": m["photo_url"],   # URL Supabase image/vidéo
+            "photo_url": m["photo_url"],   # URL Supabase (image/vidéo) ou null
             "age_min": int(m["age_min"]) if m["age_min"] is not None else None,
             "phone": m.get("phone"),
         })
