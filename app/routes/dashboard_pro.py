@@ -197,7 +197,12 @@ async def dashboard_pro():
     const sev=severityScore(it);
     return `
       <tr class="border-b last:border-none hover:bg-gray-50">
-        <td class="p-2 text-xs text-gray-500">${it.id}</td>
+        <td class="p-2 text-xs">
+  <a href="/map?incident_id=${it.id}" class="text-blue-600 underline" target="_blank">
+    ${it.id}
+  </a>
+</td>
+
         <td class="p-2 font-medium">${it.kind}</td>
         <td class="p-2">${it.signal}</td>
         <td class="p-2">${(it.lat?.toFixed?it.lat.toFixed(5):it.lat)}, ${(it.lng?.toFixed?it.lng.toFixed(5):it.lng)}</td>
