@@ -101,14 +101,17 @@ async def dashboard_pro():
   const tokenKey = "ayii_admin_token";
   const api = (p)=> p.startsWith("http")?p:(location.origin+p);
 
-  // focus éventuel (quand on arrive avec ?focus_id=...)
+  // 🔍 récupère l'ID ciblé dans l'URL : ?focus_id=xxxx
   const urlParams = new URLSearchParams(location.search);
   const focusId = urlParams.get("focus_id") || "";
 
   // token
   const tokInput = $("#admintok");
   tokInput.value = localStorage.getItem(tokenKey) || "";
-  $("#saveTok").onclick = ()=>{ localStorage.setItem(tokenKey, tokInput.value.trim()); loadAll(); };
+  $("#saveTok").onclick = ()=>{ 
+    localStorage.setItem(tokenKey, tokInput.value.trim()); 
+    loadAll(); 
+  };
 
   function hdr(){
     const t=(localStorage.getItem(tokenKey)||"").trim();
@@ -137,7 +140,9 @@ async def dashboard_pro():
   async function loadTimeseries(){
     try{
       const k=$("#kindFilter").value.trim();
-      const url = k ? api(`/metrics/incidents_by_day?days=30&kind=${encodeURIComponent(k)}`) : api(`/metrics/incidents_by_day?days=30`);
+      const url = k 
+        ? api(`/metrics/incidents_by_day?days=30&kind=${encodeURIComponent(k)}`) 
+        : api(`/metrics/incidents_by_day?days=30`);
       const j=await getJSON(url);
       const series=(j.series||[]).slice().sort((a,b)=>a.day.localeCompare(b.day));
       const labels=series.map(r=>r.day);
@@ -261,12 +266,14 @@ async def dashboard_pro():
         .sort((a,b)=> (Date.parse(b.created_at||0)||0) - (Date.parse(a.created_at||0)||0));
       renderIncidents(items);
 
-      // scroll auto sur l'incident ciblé si ?focus_id=...
+      // 🔁 petit délai pour être sûr que le DOM est prêt avant scroll
       if (focusId) {
-        const row = document.querySelector(`tr[data-incid="${focusId}"]`);
-        if (row) {
-          row.scrollIntoView({ behavior: "smooth", block: "center" });
-        }
+        setTimeout(() => {
+          const row = document.querySelector(`tr[data-incid="${focusId}"]`);
+          if (row) {
+            row.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+        }, 50);
       }
     }catch(e){ console.error(e); }
   }
@@ -274,10 +281,15 @@ async def dashboard_pro():
   $("#reloadTS").onclick=loadTimeseries;
   $("#reloadInc").onclick=loadIncidents;
 
-  async function loadAll(){ await Promise.all([loadSummary(), loadTimeseries(), loadPieKind(), loadIncidents()]); }
+  async function loadAll(){ 
+    await Promise.all([loadSummary(), loadTimeseries(), loadPieKind(), loadIncidents()]); 
+  }
+
+  // au chargement, si un token est déjà présent, on charge tout direct
   if((localStorage.getItem(tokenKey)||"").trim()) loadAll();
 })();
 </script>
+
 </body>
 </html>
 """
