@@ -101,6 +101,10 @@ async def dashboard_pro():
   const tokenKey = "ayii_admin_token";
   const api = (p)=> p.startsWith("http")?p:(location.origin+p);
 
+  // focus éventuel (quand on arrive avec ?focus_id=...)
+  const urlParams = new URLSearchParams(location.search);
+  const focusId = urlParams.get("focus_id") || "";
+
   // token
   const tokInput = $("#admintok");
   tokInput.value = localStorage.getItem(tokenKey) || "";
@@ -190,25 +194,24 @@ async def dashboard_pro():
     return `<span class="pill" style="background:${bg};color:${fg}">Gravité ${label} (${score})</span>`;
   }
 
-  // Incidents table
   function fmtAgeMin(m){ return (m==null)? "-" : `${m} min`; }
+
+  // Incidents table
   function renderIncidents(items){
-  const rows=(items||[]).map(it=>{
-    const sev=severityScore(it);
-    return `
-      <tr class="border-b last:border-none hover:bg-gray-50">
+    const rows=(items||[]).map(it=>{
+      const sev=severityScore(it);
+      const highlight = focusId && String(it.id) === focusId;
+      return `
+      <tr class="border-b last:border-none hover:bg-gray-50${highlight ? " bg-yellow-50" : ""}" data-incid="${it.id}">
         <td class="p-2 text-xs">
-  <a
-    href="https://ayii.netlify.app/?focus_id=${it.id}&focus_lat=${it.lat}&focus_lng=${it.lng}&focus_phone=${it.phone || ''}"
-    class="text-blue-600 underline"
-    target="_blank"
-  >
-    ${it.id}
-  </a>
-</td>
-
-
-
+          <a
+            href="https://ayii.netlify.app/?focus_id=${it.id}&focus_lat=${it.lat}&focus_lng=${it.lng}&focus_phone=${encodeURIComponent(it.phone || "")}"
+            class="text-blue-600 underline"
+            target="_blank"
+          >
+            ${it.id}
+          </a>
+        </td>
         <td class="p-2 font-medium">${it.kind}</td>
         <td class="p-2">${it.signal}</td>
         <td class="p-2">${(it.lat?.toFixed?it.lat.toFixed(5):it.lat)}, ${(it.lng?.toFixed?it.lng.toFixed(5):it.lng)}</td>
@@ -226,38 +229,45 @@ async def dashboard_pro():
             : `<span class="text-gray-400">—</span>`
         }</td>
       </tr>`;
-  }).join("");
+    }).join("");
 
-  $("#incTable").innerHTML = `
-    <div class="overflow-x-auto">
-      <table class="w-full text-sm">
-        <thead>
-          <tr class="text-left text-gray-500 border-b">
-            <th class="p-2">ID</th>
-            <th class="p-2">Type</th>
-            <th class="p-2">Signal</th>
-            <th class="p-2">Coord.</th>
-            <th class="p-2">Créé</th>
-            <th class="p-2">Statut</th>
-            <th class="p-2">Âge</th>
-            <th class="p-2">Gravité</th>
-            <th class="p-2">📞 Tel</th>
-            <th class="p-2">Pièce jointe</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>`;
-}
+    $("#incTable").innerHTML = `
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-left text-gray-500 border-b">
+              <th class="p-2">ID</th>
+              <th class="p-2">Type</th>
+              <th class="p-2">Signal</th>
+              <th class="p-2">Coord.</th>
+              <th class="p-2">Créé</th>
+              <th class="p-2">Statut</th>
+              <th class="p-2">Âge</th>
+              <th class="p-2">Gravité</th>
+              <th class="p-2">📞 Tel</th>
+              <th class="p-2">Pièce jointe</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
 
   async function loadIncidents(){
     try{
       const s=$("#status").value;
       const j=await getJSON(api(`/cta/incidents_v2?status=${encodeURIComponent(s)}&limit=20`));
       const items = (j.items || []).slice()
-      .sort((a,b)=> (Date.parse(b.created_at||0)||0) - (Date.parse(a.created_at||0)||0));
+        .sort((a,b)=> (Date.parse(b.created_at||0)||0) - (Date.parse(a.created_at||0)||0));
       renderIncidents(items);
 
+      // scroll auto sur l'incident ciblé si ?focus_id=...
+      if (focusId) {
+        const row = document.querySelector(`tr[data-incid="${focusId}"]`);
+        if (row) {
+          row.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      }
     }catch(e){ console.error(e); }
   }
 
