@@ -198,10 +198,15 @@ async def dashboard_pro():
     return `
       <tr class="border-b last:border-none hover:bg-gray-50">
         <td class="p-2 text-xs">
-  <a href="https://ayii.netlify.app/?incident_id=${it.id}" class="text-blue-600 underline" target="_blank">
+  <a
+    href="https://ayii.netlify.app/?focus_id=${it.id}&focus_lat=${it.lat}&focus_lng=${it.lng}&focus_phone=${it.phone || ''}"
+    class="text-blue-600 underline"
+    target="_blank"
+  >
     ${it.id}
   </a>
 </td>
+
 
 
         <td class="p-2 font-medium">${it.kind}</td>
